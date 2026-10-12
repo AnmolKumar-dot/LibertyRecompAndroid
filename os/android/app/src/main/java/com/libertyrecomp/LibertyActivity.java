@@ -72,6 +72,8 @@ public class LibertyActivity extends SDLActivity {
     static final String EXTRA_SHADOWS_OFF = "perf_shadows_off";
     /** Launcher "Performance test settings": fixed 0.5 draw distance. */
     static final String EXTRA_HALF_DRAW_DISTANCE = "perf_half_draw_distance";
+    /** Launcher "Performance test settings": GPU held at its highest clock. */
+    static final String EXTRA_GPU_TURBO = "perf_gpu_turbo";
     /** Launcher "Performance test settings": reflection intervals in frames. */
     static final String EXTRA_WATER_REFLECTION_INTERVAL = "perf_water_reflection_interval";
     static final String EXTRA_OTHER_REFLECTION_INTERVAL = "perf_other_reflection_interval";
@@ -208,6 +210,8 @@ public class LibertyActivity extends SDLActivity {
                 || a.startsWith("--gta4_native_water_reflection_interval")
                 || a.startsWith("--gta4_native_environment_reflection_interval"));
         arguments.add("--gta4_native_shadow_interval=" + (shadowsOff ? 0 : 1));
+        arguments.removeIf(a -> a.startsWith("--android_gpu_turbo"));
+        arguments.add("--android_gpu_turbo=" + intent.getBooleanExtra(EXTRA_GPU_TURBO, false));
         if (intent.getBooleanExtra(EXTRA_HALF_DRAW_DISTANCE, false)) {
             // Fixed: the dynamic controller would lower it further.
             arguments.removeIf(a -> a.startsWith("--gta4_draw_distance_scale")

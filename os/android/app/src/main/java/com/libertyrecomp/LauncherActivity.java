@@ -1031,6 +1031,7 @@ public class LauncherActivity extends Activity {
     private static final String PERF_PREFERENCES = "performance_test";
     private static final String PERF_SHADOWS_OFF = "sun_shadows_off";
     private static final String PERF_HALF_DRAW_DISTANCE = "half_draw_distance";
+    private static final String PERF_GPU_TURBO = "gpu_turbo";
     private static final String PERF_WATER_REFLECTIONS = "water_reflection_interval";
     private static final String PERF_OTHER_REFLECTIONS = "other_reflection_interval";
 
@@ -1069,6 +1070,10 @@ public class LauncherActivity extends Activity {
                 "Nothing casts a sun shadow; the shadow map is not drawn.",
                 perf.getBoolean(PERF_SHADOWS_OFF, false));
         panel.addView(shadows, matchWrap(dp(4)));
+        android.widget.CheckBox turbo = styledCheck("GPU turbo",
+                "Keeps the Adreno GPU at its highest clock. More heat and battery use.",
+                perf.getBoolean(PERF_GPU_TURBO, false));
+        panel.addView(turbo, matchWrap(dp(4)));
 
         RadioGroup water = intervalChoice(panel, "Water reflections",
                 perf.getInt(PERF_WATER_REFLECTIONS, 1), 1000);
@@ -1099,6 +1104,7 @@ public class LauncherActivity extends Activity {
             perf.edit()
                     .putBoolean(PERF_HALF_DRAW_DISTANCE, drawDistance.isChecked())
                     .putBoolean(PERF_SHADOWS_OFF, shadows.isChecked())
+                    .putBoolean(PERF_GPU_TURBO, turbo.isChecked())
                     .putInt(PERF_WATER_REFLECTIONS, checkedInterval(water, 1000))
                     .putInt(PERF_OTHER_REFLECTIONS, checkedInterval(other, 2000))
                     .apply();
@@ -1192,6 +1198,7 @@ public class LauncherActivity extends Activity {
                 intent.putExtra(LibertyActivity.EXTRA_SHADOWS_OFF, perf.getBoolean(PERF_SHADOWS_OFF, false));
                 intent.putExtra(LibertyActivity.EXTRA_HALF_DRAW_DISTANCE,
                         perf.getBoolean(PERF_HALF_DRAW_DISTANCE, false));
+                intent.putExtra(LibertyActivity.EXTRA_GPU_TURBO, perf.getBoolean(PERF_GPU_TURBO, false));
                 intent.putExtra(LibertyActivity.EXTRA_WATER_REFLECTION_INTERVAL,
                         perf.getInt(PERF_WATER_REFLECTIONS, 1));
                 intent.putExtra(LibertyActivity.EXTRA_OTHER_REFLECTION_INTERVAL,

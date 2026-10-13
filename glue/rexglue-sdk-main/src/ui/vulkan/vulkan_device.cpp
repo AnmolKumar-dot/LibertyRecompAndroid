@@ -255,6 +255,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_LOCAL_EXTENSION(KHR_pipeline_executable_properties)
   }
 #endif
+  // GPU breadcrumbs for hang diagnosis (gta4_native_gpu_breadcrumbs).
+  XE_UI_VULKAN_STRUCT_EXTENSION(AMD_buffer_marker)
   if (with_swapchain) {
     // #2.
     XE_UI_VULKAN_STRUCT_EXTENSION(KHR_swapchain)
@@ -1085,6 +1087,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
 #undef XE_UI_VULKAN_FUNCTION
 
+  if (device->extensions_.ext_AMD_buffer_marker) {
+    dfn.vkCmdWriteBufferMarkerAMD = reinterpret_cast<PFN_vkCmdWriteBufferMarkerAMD>(
+        ifn.vkGetDeviceProcAddr(device->device_, "vkCmdWriteBufferMarkerAMD"));
+    if (!dfn.vkCmdWriteBufferMarkerAMD) device->extensions_.ext_AMD_buffer_marker = false;
+  }
   if (device->extensions_.ext_GOOGLE_display_timing) {
     dfn.vkGetRefreshCycleDurationGOOGLE = reinterpret_cast<PFN_vkGetRefreshCycleDurationGOOGLE>(
         ifn.vkGetDeviceProcAddr(device->device_, "vkGetRefreshCycleDurationGOOGLE"));

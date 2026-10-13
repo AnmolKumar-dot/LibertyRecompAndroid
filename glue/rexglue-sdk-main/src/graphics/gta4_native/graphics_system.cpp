@@ -17,6 +17,7 @@
 #include "native_spirv_early_tests.h"
 #include "native_spirv_colorless.h"
 #include "native_spirv_ubo_constants.h"
+#include "native_spirv_ubo_shared.h"
 #include "native_spirv_constant_range.h"
 #include "native_fixed_state_hash.h"
 #include "native_cpu_profile_scope.h"
@@ -102,6 +103,7 @@
 #include "../shaders/vulkan_spirv/fullscreen_cw_vs.h"
 #include "depth_handoff_ps.h"
 #include "scene_depth_handoff_ps.h"
+#include "texture_detile_cs.h"
 #include "packed_depth_alias_ps.h"
 #include "depth_handoff_util.h"
 #include "alpha_to_coverage_util.h"
@@ -230,6 +232,27 @@ REXCVAR_DEFINE_BOOL(gta4_native_water_occlusion_queries, false, "GTA IV/Graphics
                     "no longer changes the water reflection)");
 REXCVAR_DEFINE_BOOL(gta4_native_recorder_prefetch, true, "GTA IV/Graphics/Native Renderer",
                     "Prefetch the commands the recorder reaches next (and their state objects)");
+REXCVAR_DEFINE_BOOL(gta4_native_gpu_breadcrumbs, false, "GTA IV/Diagnostics",
+                    "Mark each rendering scope's completion on the GPU and log the scope a "
+                    "hung (driver-skipped) frame stopped in");
+REXCVAR_DEFINE_BOOL(gta4_native_sampled_stage_biases, true, "GTA IV/Graphics/Native Renderer",
+                    "Compute texture LOD biases only for the stages the draw's shaders sample");
+REXCVAR_DEFINE_BOOL(gta4_native_ubo_shared_constants, true, "GTA IV/Graphics/Native Renderer",
+                    "Read the shared constants (descriptor indices, LOD biases, booleans, alpha "
+                    "threshold) through a uniform buffer instead of device-address loads "
+                    "(applies when shaders load)");
+REXCVAR_DEFINE_BOOL(gta4_native_gpu_detile, true, "GTA IV/Graphics/Native Renderer",
+                    "Capture textures as raw guest bytes and untile/byte-swap them on the GPU "
+                    "(compute) instead of on the capturing title thread");
+REXCVAR_DEFINE_BOOL(gta4_native_gpu_detile_validate, false, "GTA IV/Diagnostics",
+                    "Also convert GPU-detiled textures on the CPU and compare the results once "
+                    "the frame has completed");
+REXCVAR_DEFINE_BOOL(gta4_native_shared_key_memo, true, "GTA IV/Graphics/Native Renderer",
+                    "Reuse the previous draw's shared-constant identity when its semantic key is "
+                    "equal, instead of hashing the key and probing the frame map");
+REXCVAR_DEFINE_BOOL(gta4_native_upload_memo_first, true, "GTA IV/Graphics/Native Renderer",
+                    "Bind a vertex/index buffer straight from its memoized persistent GPU copy, "
+                    "before the frame's upload map and the persistent map");
 REXCVAR_DEFINE_BOOL(gta4_native_fold_depth_clears, true, "GTA IV/Graphics/Native Renderer",
                     "Clear depth/stencil through the rendering scope's load op when a scope opens "
                     "on a full-target clear, so Turnip keeps LRZ for the pass");
@@ -259,6 +282,11 @@ REXCVAR_DEFINE_BOOL(gta4_native_direct_constant_apply, true, "GTA IV/Graphics/Na
 REXCVAR_DEFINE_BOOL(gta4_native_stamped_protection, true, "GTA IV/Graphics/Native Renderer",
                     "Add each texture to the assembled frame's protection set once per frame, "
                     "not once per draw");
+REXCVAR_DEFINE_BOOL(gta4_native_recheck_vertex_textures, true, "GTA IV/Graphics/Native Renderer",
+                    "Re-read textures sampled by vertex shaders once a frame: the title updates "
+                    "them in place without an unlock (vehicle deformation)");
+REXCVAR_DEFINE_BOOL(gta4_native_vertex_texture_trace, false, "GTA IV/Diagnostics",
+                    "Log textures sampled by vertex shaders and every change of their contents");
 REXCVAR_DEFINE_BOOL(gta4_native_buffer_validation_per_frame, true, "GTA IV/Graphics/Native Renderer",
                     "Check a clean vertex/index buffer's shadow copy against guest memory once per "
                     "frame, not on every draw that uses it");
@@ -3484,7 +3512,8 @@ void Gta4NativeGraphicsSystem::PublishDeferredNativeTrace() {
 }
 
 bool Gta4NativeGraphicsSystem::IsNativeFlightRecorderEnabled() const {
-  return gpu_flight::IsEnabled() || IsNativeFlightVerboseLoggingEnabled();
+  return native_flight_enabled_.load(std::memory_order_relaxed) ||
+         IsNativeFlightVerboseLoggingEnabled();
 }
 
 void Gta4NativeGraphicsSystem::StageNativeFlightResource(NativeFlightResourceKind kind,
@@ -4946,9 +4975,10 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
       header.type == CommandType::kDrawIndexedPrimitive) {
     const uint32_t device = CommandDevice(header.type, command);
     const auto producer_state = producer_device_shader_states_.find(device);
+    uint32_t vertex_texture_mask = 0;
     if (producer_state != producer_device_shader_states_.end()) {
-      const auto append_shader_usage = [this, &native_command](uint32_t shader_handle,
-                                                               ShaderStage expected_stage) {
+      const auto append_shader_usage = [this, &native_command, &vertex_texture_mask](
+                                           uint32_t shader_handle, ShaderStage expected_stage) {
         if (!shader_handle) {
           return true;
         }
@@ -4958,6 +4988,9 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
           return false;
         }
         native_command.used_texture_mask |= metadata->second.used_texture_mask;
+        if (expected_stage == ShaderStage::kVertex) {
+          vertex_texture_mask |= metadata->second.used_texture_mask;
+        }
         return true;
       };
       if (!append_shader_usage(producer_state->second.pixel_shader, ShaderStage::kPixel) ||
@@ -4985,9 +5018,47 @@ bool Gta4NativeGraphicsSystem::ValidateAndCopyCommand(const void* command, size_
       fetch.dword_5 = LoadGuestWord(device_state, fetch_offset + sizeof(uint32_t) * 5);
       const uint32_t handle =
           LoadGuestWord(device_state, kTextureHandleBase + stage * sizeof(uint32_t));
-      if (handle) {
+      if (!handle) continue;
+      // Small CPU-written vertex-shader textures (vehicle deformation, 128x128
+      // 32_FLOAT) are rewritten in place without an unlock, so the clean cache
+      // would keep the first capture. Mark them dirty once a frame: the full
+      // path recreates the resource only when the bytes changed. Render
+      // targets sampled by vertex shaders (depth, shadow maps) are GPU-owned
+      // and large; re-reading guest memory for them is slow and wrong.
+      if ((vertex_texture_mask & (uint32_t{1} << stage)) &&
+          REXCVAR_GET(gta4_native_recheck_vertex_textures)) {
+        const uint32_t frame = g_native_memory_profile_event_frame.load(std::memory_order_relaxed);
+        auto [recheck, inserted] = vertex_texture_rechecks_.try_emplace(handle);
+        if (inserted || recheck->second.frame != frame) {
+          recheck->second.frame = frame;
+          std::lock_guard lock(texture_resource_mutex_);
+          const auto existing = texture_resources_.find(handle);
+          const NativeTextureResource* cached =
+              existing != texture_resources_.end() ? existing->second.get() : nullptr;
+          if (!cached || (!cached->gpu_produced && (cached->info.width + 1) <= 512 &&
+                          (cached->info.height + 1) <= 512)) {
+            ForgetTextureCapture(handle);
+            dirty_texture_handles_.insert(handle);
+          }
+        }
         native_command.textures[stage] = CaptureTextureResource(handle, fetch, stage);
+        const auto& texture = native_command.textures[stage];
+        const uint64_t generation = texture ? texture->generation : 0;
+        if (REXCVAR_GET(gta4_native_vertex_texture_trace) && generation != recheck->second.generation) {
+          REXLOG_WARN(
+              "gta4-vertex-texture: handle={:08X} stage={} generation={} -> {} frame={} "
+              "format={} size={}x{} tiled={} base={:08X}",
+              handle, stage, recheck->second.generation, generation, frame,
+              texture ? uint32_t(texture->info.format) : 0,
+              texture ? texture->info.width + 1 : 0, texture ? texture->info.height + 1 : 0,
+              texture ? texture->info.is_tiled : false,
+              texture ? texture->info.memory.base_address : 0);
+        }
+        recheck->second.generation = generation;
+        if (vertex_texture_rechecks_.size() > 4096) vertex_texture_rechecks_.clear();
+        continue;
       }
+      native_command.textures[stage] = CaptureTextureResource(handle, fetch, stage);
     }
   }
 
@@ -5365,6 +5436,12 @@ Gta4NativeGraphicsSystem::CaptureTextureResource(uint32_t handle,
   return resource;
 }
 
+namespace {
+// Set while a capture repeats itself on the CPU path after its GPU-detile
+// attempt could not describe a subresource.
+thread_local bool t_force_cpu_texture_detile = false;
+}  // namespace
+
 std::shared_ptr<const Gta4NativeGraphicsSystem::NativeTextureResource>
 Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
     uint32_t handle, const xenos::xe_gpu_texture_fetch_t& fetch, uint32_t stage,
@@ -5718,6 +5795,22 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
   std::vector<uint8_t> payload;
   std::vector<NativeTextureResource::MipLevel> mip_levels;
   const uint32_t guest_bytes_per_block_log2 = rex::log2_floor(guest_bytes_per_block);
+  // GPU detiling: plain block copies of 4-16 byte blocks (CopySwapBlock);
+  // block-to-pixel and DXT3A conversions and font candidates (identified by
+  // their converted bytes) stay on the CPU.
+  const bool gpu_detile =
+      !t_force_cpu_texture_detile && REXCVAR_GET(gta4_native_gpu_detile) &&
+      texture_detile_available_.load(std::memory_order_acquire) && !vector_font_candidate &&
+      base_format != xenos::TextureFormat::k_CTX1 && base_format != xenos::TextureFormat::k_DXN &&
+      base_format != xenos::TextureFormat::k_DXT5A &&
+      base_format != xenos::TextureFormat::k_DXT3A &&
+      guest_bytes_per_block == host_bytes_per_block && host_bytes_per_block >= 4 &&
+      host_bytes_per_block <= 16;
+  const bool cpu_convert = !gpu_detile || REXCVAR_GET(gta4_native_gpu_detile_validate);
+  std::vector<uint8_t> raw_payload;
+  std::vector<NativeTextureResource::DetileJob> detile_jobs;
+  size_t converted_size = 0;
+  bool detile_describable = true;
   const bool is_3d = info.dimension == xenos::DataDimension::k3D;
   const uint32_t array_layer_count = info.dimension == xenos::DataDimension::kCube ? 6
                                      : info.is_stacked                             ? info.depth + 1
@@ -5755,7 +5848,7 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
     if (!subresource_payload_size || subresource_payload_size > kMaximumResourcePayloadSize) {
       rejected_mip = mip;
       rejected_subresource_payload_size = subresource_payload_size;
-      rejected_payload_offset = payload.size();
+      rejected_payload_offset = converted_size;
       return reject("payload-size");
     }
 
@@ -5776,7 +5869,7 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
       // forcing zero to one alignment unit, which makes an otherwise valid
       // resource whose first mip exactly reaches the payload limit exceed it
       // by payload_alignment bytes.
-      const size_t payload_offset = rex::round_up(payload.size(), payload_alignment, false);
+      const size_t payload_offset = rex::round_up(converted_size, payload_alignment, false);
       if (uint64_t(payload_offset) + subresource_payload_size > kMaximumResourcePayloadSize) {
         rejected_mip = mip;
         rejected_layer = layer;
@@ -5796,9 +5889,58 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
               mip, layer, subresource_payload_size, payload_offset, kMaximumResourcePayloadSize);
         }
       }
+      converted_size = payload_offset + static_cast<size_t>(subresource_payload_size);
+      const uint8_t* layer_source = source + size_t(layer) * level_layout.array_slice_stride_bytes;
+      if (gpu_detile && detile_describable) {
+        // The raw span the shader may read: the tile-aligned surface (tiled
+        // addressing permutes blocks within it) or the linear extent.
+        const uint64_t pitch_h = guest_extent.block_pitch_h;
+        uint64_t span = 0;
+        if (info.is_tiled) {
+          const uint64_t aligned_pitch = (pitch_h + 31) & ~uint64_t(31);
+          if (is_3d) {
+            const uint64_t aligned_height = (uint64_t(guest_extent.block_pitch_v) + 31) & ~uint64_t(31);
+            const uint64_t aligned_depth = (uint64_t(mip_depth) + 3) & ~uint64_t(3);
+            span = aligned_pitch * aligned_height * aligned_depth << guest_bytes_per_block_log2;
+          } else {
+            const uint64_t rows =
+                (uint64_t(packed_offset_y) + copy_block_height + 31) & ~uint64_t(31);
+            span = aligned_pitch * rows << guest_bytes_per_block_log2;
+          }
+        } else {
+          span = ((uint64_t(mip_depth - 1) * guest_extent.block_pitch_v + packed_offset_y +
+                   copy_block_height - 1) * pitch_h + packed_offset_x + copy_block_width)
+                 << guest_bytes_per_block_log2;
+        }
+        const uint64_t guest_start =
+            uint64_t(mip_address) + uint64_t(layer) * level_layout.array_slice_stride_bytes;
+        if (!span || guest_start + span > 0x20000000ull || span > kMaximumResourcePayloadSize) {
+          detile_describable = false;
+        } else {
+          NativeTextureResource::DetileJob job{};
+          job.raw_offset = rex::round_up(raw_payload.size(), size_t(16), false);
+          job.destination_offset = payload_offset;
+          job.block_width = copy_block_width;
+          job.block_height = copy_block_height;
+          job.depth = mip_depth;
+          job.pitch_h = guest_extent.block_pitch_h;
+          job.pitch_v = guest_extent.block_pitch_v;
+          job.flags = (info.is_tiled ? 1u : 0u) | (is_3d ? 2u : 0u) |
+                      ((uint32_t(info.endianness) & 3u) << 4) | (guest_bytes_per_block_log2 << 8);
+          job.packed_x = packed_offset_x;
+          job.packed_y = packed_offset_y;
+          job.destination_pitch = host_extent.block_pitch_h;
+          job.destination_slice = host_extent.block_height * host_extent.block_pitch_h;
+          raw_payload.resize(job.raw_offset + size_t(span));
+          std::memcpy(raw_payload.data() + job.raw_offset, layer_source, size_t(span));
+          detile_jobs.push_back(job);
+        }
+      }
+      if (!cpu_convert) {
+        // The GPU produces this subresource; only its description is kept.
+      } else {
       payload.resize(payload_offset + static_cast<size_t>(subresource_payload_size), uint8_t{});
       uint8_t* destination = payload.data() + payload_offset;
-      const uint8_t* layer_source = source + size_t(layer) * level_layout.array_slice_stride_bytes;
       for (uint32_t block_z = 0; block_z < mip_depth; ++block_z) {
         for (uint32_t block_y = 0; block_y < copy_block_height; ++block_y) {
           for (uint32_t block_x = 0; block_x < copy_block_width; ++block_x) {
@@ -5863,6 +6005,7 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
           }
         }
       }
+      }  // cpu_convert
 
       NativeTextureResource::MipLevel mip_level{};
       mip_level.level = mip;
@@ -5878,7 +6021,21 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
     }
   }
 
-  const uint64_t content_hash = XXH3_64bits(payload.data(), payload.size());
+  if (gpu_detile && !detile_describable) {
+    // A subresource the shader cannot address: convert this texture on the CPU.
+    t_force_cpu_texture_detile = true;
+    auto retried = CaptureTextureResourceUncached(handle, fetch, stage, cacheable);
+    t_force_cpu_texture_detile = false;
+    return retried;
+  }
+  std::shared_ptr<const std::vector<uint8_t>> detile_reference;
+  if (gpu_detile) {
+    if (cpu_convert) detile_reference = std::make_shared<const std::vector<uint8_t>>(std::move(payload));
+    // Raw bytes identify the content as well as converted ones do.
+    payload = std::move(raw_payload);
+  }
+  const uint64_t content_hash = XXH3_64bits(payload.data(), payload.size()) ^
+                                (gpu_detile ? 0x9E3779B97F4A7C15ull : 0);
   const size_t stock_identity_size = std::min(payload.size(), kStockFontIdentityPayloadSize);
   const uint64_t stock_identity_hash = vector_font_candidate
       ? core::StockFontIdentity(payload)
@@ -5907,6 +6064,7 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
         resource->content_hash == content_hash &&
         resource->vector_font_id == vector_font_id &&
         resource->vector_font_replacement == wants_vector_font &&
+        resource->detile_jobs.empty() == detile_jobs.empty() &&
         (resource->vector_font_replacement || resource->payload == payload)) {
       if (ShouldClearNativeTextureDirtyFlag(cache_entry_dirty, true)) {
         dirty_texture_handles_.erase(handle);
@@ -5976,6 +6134,9 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
         resource->payload.size(), replacement_hash);
   } else {
     resource->payload = std::move(payload);
+    resource->detile_jobs = std::move(detile_jobs);
+    resource->converted_payload_size = converted_size;
+    resource->detile_reference = std::move(detile_reference);
     resource->mip_levels = std::move(mip_levels);
   }
   if (existing != texture_resources_.end() && existing->second &&
@@ -7785,6 +7946,11 @@ bool Gta4NativeGraphicsSystem::SnapshotDrawConstants(NativeCommand& command,
   hash_upload(1, command.shader_state->pixel_constants, pixel_shader, kPixelConstantsSize,
               command.pixel_constants_upload_hash, command.pixel_constants_upload_bytes);
   WriteWorkerRingConstants(command, vertex_shader, pixel_shader);
+  {
+    const uint64_t memo_signature =
+        HashNativeFixedFunctionState(NativePipelineMemoState(command.fixed_function_state));
+    command.pipeline_memo_signature = memo_signature ? memo_signature : 1;
+  }
   command.texture_inputs_signature = 0;
   if (command.pipeline_state && command.used_texture_mask) {
     // Same inputs as NativePreparedTextureInputsEqual, packed and hashed here
@@ -8290,6 +8456,14 @@ void Gta4NativeGraphicsSystem::RegisterShader(const RegisterShaderCommand& comma
         spirv = std::move(rewritten->words);
         ++ubo_rewritten_shaders_;
         ubo_rewritten_loads_ += rewritten->rewritten_loads;
+      }
+      if (REXCVAR_GET(gta4_native_ubo_shared_constants)) {
+        auto shared = RewriteSpirvSharedConstantsToUbo(
+            spirv, 2, uint32_t(sizeof(NativeSharedConstants) / 16), kDescriptorSetCount, 2);
+        if (shared && shared->rewritten_loads) {
+          spirv = std::move(shared->words);
+          ubo_rewritten_loads_ += shared->rewritten_loads;
+        }
       }
     };
     if (REXCVAR_GET(gta4_native_dump_shaders)) {
@@ -8990,6 +9164,30 @@ void Gta4NativeGraphicsSystem::DestroyNativePersistentBuffers() {
   persistent_buffer_upload_bytes_ = 0;
 }
 
+void Gta4NativeGraphicsSystem::TouchPersistentEntry(NativePersistentBufferEntry& entry) {
+  // The same marks a GetOrCreatePersistentBuffer hit leaves: the entry stays
+  // alive until this submission retires.
+  const uint64_t predicted_submission =
+      submission_tracker_ ? submission_tracker_->GetCurrentSubmission() : 0;
+  entry.last_used_submission = std::max(entry.last_used_submission, predicted_submission);
+  entry.last_used_frame = active_texture_frame_;
+  StageNativeFlightResource(NativeFlightResourceKind::kPersistentBuffer,
+                            NativeVulkanHandleIdentity(entry.buffer), 0, entry.key.generation);
+  ++persistent_buffer_hits_;
+}
+
+Gta4NativeGraphicsSystem::NativePersistentBufferEntry* Gta4NativeGraphicsSystem::UsePersistentMemo(
+    const NativeBufferResource& owner, const NativePersistentBufferKey& key) {
+  if (!owner.persistent_memo_entry || owner.persistent_memo_epoch != persistent_buffer_epoch_) {
+    return nullptr;
+  }
+  NativePersistentBufferKey memo_key;
+  std::memcpy(&memo_key, owner.persistent_memo_key.data(), sizeof(memo_key));
+  if (!(memo_key == key)) return nullptr;
+  TouchPersistentEntry(*owner.persistent_memo_entry);
+  return owner.persistent_memo_entry;
+}
+
 bool Gta4NativeGraphicsSystem::GetOrCreatePersistentBuffer(
     VkCommandBuffer command_buffer, const std::shared_ptr<const NativeBufferResource>& owner,
     const NativePersistentBufferKey& key, const uint8_t* source, VkDeviceSize size,
@@ -9393,6 +9591,7 @@ bool Gta4NativeGraphicsSystem::ResetFrameConstantArena(uint32_t slot, uint64_t c
     return false;
   }
   arena.next_shared_identity = 1;
+  arena.last_shared_identity = 0;
   arena.storage.write_offset = 0;
   arena.uploads.BeginFrame();
   return true;
@@ -9433,24 +9632,28 @@ void Gta4NativeGraphicsSystem::InitializeWorkerConstantRing() {
     worker_constant_ring_ = NativeUploadBuffer{};
     return;
   }
-  if (worker_ring_ubo_set_) {
+  if (worker_ring_ubo_sets_[0]) {
+    // Bindings 0/1 now; binding 2 (the slot's arena) when the slot first binds.
     auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
     const ui::vulkan::VulkanDevice* vulkan_device = vulkan_provider->vulkan_device();
     std::array<VkDescriptorBufferInfo, 2> buffers{};
     buffers[0] = {worker_constant_ring_.buffer, 0, kVertexConstantsSize};
     buffers[1] = {worker_constant_ring_.buffer, 0, kPixelConstantsSize};
-    std::array<VkWriteDescriptorSet, 2> writes{};
-    for (uint32_t index = 0; index < 2; ++index) {
-      writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-      writes[index].dstSet = worker_ring_ubo_set_;
-      writes[index].dstBinding = index;
-      writes[index].descriptorCount = 1;
-      writes[index].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-      writes[index].pBufferInfo = &buffers[index];
+    for (VkDescriptorSet ring_set : worker_ring_ubo_sets_) {
+      std::array<VkWriteDescriptorSet, 2> writes{};
+      for (uint32_t index = 0; index < 2; ++index) {
+        writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[index].dstSet = ring_set;
+        writes[index].dstBinding = index;
+        writes[index].descriptorCount = 1;
+        writes[index].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        writes[index].pBufferInfo = &buffers[index];
+      }
+      vulkan_device->functions().vkUpdateDescriptorSets(vulkan_device->device(),
+                                                        uint32_t(writes.size()), writes.data(), 0,
+                                                        nullptr);
     }
-    vulkan_device->functions().vkUpdateDescriptorSets(vulkan_device->device(),
-                                                      uint32_t(writes.size()), writes.data(), 0,
-                                                      nullptr);
+    worker_ring_set_shared_buffers_.fill(VK_NULL_HANDLE);
   }
   worker_ring_valid_.store(true, std::memory_order_release);
 }
@@ -9460,7 +9663,7 @@ void Gta4NativeGraphicsSystem::DestroyWorkerConstantRing() {
   worker_ring_valid_.store(false, std::memory_order_release);
   if (worker_constant_ring_.buffer) DestroyNativeUploadBuffer(worker_constant_ring_);
   worker_constant_ring_ = NativeUploadBuffer{};
-  worker_ring_ubo_set_ = VK_NULL_HANDLE;  // freed with its pool
+  worker_ring_ubo_sets_.fill(VK_NULL_HANDLE);  // freed with their pool
 }
 
 // Worker: the frame whose commands used the current segment was handed over.
@@ -15963,12 +16166,14 @@ bool Gta4NativeGraphicsSystem::CreateNativeDescriptors() {
   // Set 6: the guest vertex/pixel constant banks as dynamic uniform buffers
   // over the frame constant arena (see native_spirv_ubo_constants.h).
   {
-    std::array<VkDescriptorSetLayoutBinding, 2> ubo_bindings{};
-    for (uint32_t index = 0; index < 2; ++index) {
+    // Binding 2: the shared constants (native_spirv_ubo_shared.h), both stages.
+    std::array<VkDescriptorSetLayoutBinding, 3> ubo_bindings{};
+    for (uint32_t index = 0; index < 3; ++index) {
       ubo_bindings[index].binding = index;
       ubo_bindings[index].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
       ubo_bindings[index].descriptorCount = 1;
-      ubo_bindings[index].stageFlags = index ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
+      ubo_bindings[index].stageFlags = index == 2 ? VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT
+                                       : index ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
     }
     VkDescriptorSetLayoutCreateInfo ubo_layout_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     ubo_layout_info.bindingCount = uint32_t(ubo_bindings.size());
@@ -15977,11 +16182,11 @@ bool Gta4NativeGraphicsSystem::CreateNativeDescriptors() {
                                         &ubo_constants_set_layout_) != VK_SUCCESS) {
       return false;
     }
-    // One set per frame slot over its arena, and one over the worker's ring.
+    // Per frame slot: one set over its arena, one over the worker's ring.
     VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
-                                   2 * (uint32_t(NativeFrameContextRing::kSlotCount) + 1)};
+                                   3 * 2 * uint32_t(NativeFrameContextRing::kSlotCount)};
     VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pool_info.maxSets = NativeFrameContextRing::kSlotCount + 1;
+    pool_info.maxSets = 2 * NativeFrameContextRing::kSlotCount;
     pool_info.poolSizeCount = 1;
     pool_info.pPoolSizes = &pool_size;
     if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &ubo_constants_pool_) != VK_SUCCESS) {
@@ -15997,11 +16202,9 @@ bool Gta4NativeGraphicsSystem::CreateNativeDescriptors() {
       return false;
     }
     ubo_constants_set_buffers_.fill(VK_NULL_HANDLE);
-    VkDescriptorSetAllocateInfo ring_set_info = allocate_info;
-    ring_set_info.descriptorSetCount = 1;
-    ring_set_info.pSetLayouts = &ubo_constants_set_layout_;
-    if (dfn.vkAllocateDescriptorSets(device, &ring_set_info, &worker_ring_ubo_set_) != VK_SUCCESS) {
-      worker_ring_ubo_set_ = VK_NULL_HANDLE;
+    worker_ring_set_shared_buffers_.fill(VK_NULL_HANDLE);
+    if (dfn.vkAllocateDescriptorSets(device, &allocate_info, worker_ring_ubo_sets_.data()) != VK_SUCCESS) {
+      worker_ring_ubo_sets_.fill(VK_NULL_HANDLE);
     }
   }
   InitializeWorkerConstantRing();
@@ -16048,6 +16251,171 @@ bool Gta4NativeGraphicsSystem::CreateNativeDescriptors() {
     }
   }
   return true;
+}
+
+bool Gta4NativeGraphicsSystem::CreateTextureDetileObjects() {
+  auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
+  const ui::vulkan::VulkanDevice* vulkan_device = vulkan_provider->vulkan_device();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  VkPushConstantRange push_range{};
+  push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  push_range.size = 56;
+  VkPipelineLayoutCreateInfo layout_info{};
+  layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  layout_info.pushConstantRangeCount = 1;
+  layout_info.pPushConstantRanges = &push_range;
+  if (dfn.vkCreatePipelineLayout(device, &layout_info, nullptr, &texture_detile_pipeline_layout_) !=
+      VK_SUCCESS) {
+    return false;
+  }
+  VkShaderModuleCreateInfo module_info{};
+  module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+  module_info.codeSize = sizeof(gta4_native_texture_detile_cs);
+  module_info.pCode = gta4_native_texture_detile_cs;
+  VkShaderModule module = VK_NULL_HANDLE;
+  if (dfn.vkCreateShaderModule(device, &module_info, nullptr, &module) != VK_SUCCESS) {
+    return false;
+  }
+  VkComputePipelineCreateInfo pipeline_info{};
+  pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+  pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  pipeline_info.stage.module = module;
+  pipeline_info.stage.pName = "main";
+  pipeline_info.layout = texture_detile_pipeline_layout_;
+  const VkResult result = dfn.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info,
+                                                       nullptr, &texture_detile_pipeline_);
+  dfn.vkDestroyShaderModule(device, module, nullptr);
+  if (result != VK_SUCCESS) {
+    texture_detile_pipeline_ = VK_NULL_HANDLE;
+    return false;
+  }
+  texture_detile_available_.store(true, std::memory_order_release);
+  return true;
+}
+
+bool Gta4NativeGraphicsSystem::RecordTextureDetile(
+    VkCommandBuffer command_buffer, const std::shared_ptr<const NativeTextureResource>& texture,
+    const NativeUploadAllocation& raw, const NativeUploadAllocation& converted) {
+  if (!texture_detile_pipeline_ || !raw.device_address || !converted.device_address) return false;
+  auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
+  const auto& dfn = vulkan_provider->vulkan_device()->functions();
+  struct Push {
+    uint64_t source;
+    uint64_t destination;
+    uint32_t block_width, block_height, depth, pitch_h, pitch_v, flags, packed_x, packed_y,
+        destination_pitch, destination_slice;
+  };
+  static_assert(sizeof(Push) == 56);
+  dfn.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, texture_detile_pipeline_);
+  for (const NativeTextureResource::DetileJob& job : texture->detile_jobs) {
+    const Push push{raw.device_address + job.raw_offset,
+                    converted.device_address + job.destination_offset,
+                    job.block_width,
+                    job.block_height,
+                    job.depth,
+                    job.pitch_h,
+                    job.pitch_v,
+                    job.flags,
+                    job.packed_x,
+                    job.packed_y,
+                    job.destination_pitch,
+                    job.destination_slice};
+    dfn.vkCmdPushConstants(command_buffer, texture_detile_pipeline_layout_,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    dfn.vkCmdDispatch(command_buffer, (job.block_width + 7) / 8, (job.block_height + 7) / 8,
+                      job.depth);
+  }
+  VkMemoryBarrier barrier{};
+  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
+                           &barrier, 0, nullptr, 0, nullptr);
+  // The compute bind point and push constants are separate from the draw
+  // state the recorder caches, but rebind everything after them to be safe.
+  native_draw_state_cache_.Reset();
+  ubo_bound_layout_ = VK_NULL_HANDLE;
+  if (texture->detile_reference && converted.buffer == upload_buffer_.buffer) {
+    pending_detile_validations_.push_back({converted.buffer, converted.mapping, texture});
+  }
+  return true;
+}
+
+void Gta4NativeGraphicsSystem::WriteBreadcrumb(VkCommandBuffer command_buffer, std::string label) {
+  auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
+  const ui::vulkan::VulkanDevice* device = vulkan_provider->vulkan_device();
+  if (!device->extensions().ext_AMD_buffer_marker || active_frame_slot_ >= breadcrumb_frames_.size())
+    return;
+  if (!breadcrumb_buffer_.buffer && !CreateNativeUploadBuffer(4096, breadcrumb_buffer_)) return;
+  BreadcrumbFrame& frame = breadcrumb_frames_[active_frame_slot_];
+  const uint32_t value = (frame.frame << 16) | uint32_t(frame.labels.size() & 0xFFFF);
+  device->functions().vkCmdWriteBufferMarkerAMD(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                                breadcrumb_buffer_.buffer,
+                                                VkDeviceSize(active_frame_slot_) * 64, value);
+  frame.final_value = value;
+  frame.labels.push_back(std::move(label));
+}
+
+void Gta4NativeGraphicsSystem::CheckBreadcrumbs() {
+  // The slot's previous frame has completed (or was skipped) by now.
+  if (!breadcrumb_buffer_.mapping || active_frame_slot_ >= breadcrumb_frames_.size()) return;
+  BreadcrumbFrame& frame = breadcrumb_frames_[active_frame_slot_];
+  if (!frame.labels.empty()) {
+    uint32_t reached = 0;
+    std::memcpy(&reached, breadcrumb_buffer_.mapping + size_t(active_frame_slot_) * 64, 4);
+    if (reached != frame.final_value) {
+      const bool same_frame = (reached >> 16) == (frame.frame & 0xFFFF);
+      const uint32_t index = same_frame ? (reached & 0xFFFF) : 0;
+      REXLOG_WARN("gta4-native-breadcrumb: frame {} stopped after breadcrumb {} of {} (reached "
+                  "{:08X}, expected {:08X})",
+                  frame.frame, same_frame ? int(index) : -1, frame.labels.size() - 1, reached,
+                  frame.final_value);
+      const size_t first = same_frame ? index : 0;
+      for (size_t i = first; i < frame.labels.size() && i < first + 3; ++i) {
+        REXLOG_WARN("gta4-native-breadcrumb:   after {}: {}", i, frame.labels[i]);
+      }
+    }
+  }
+  frame.labels.clear();
+  frame.final_value = 0;
+}
+
+void Gta4NativeGraphicsSystem::CheckTextureDetileValidations(VkBuffer reused_buffer) {
+  // Called when reused_buffer comes back for a new frame: the frame that
+  // wrote it has completed, and its texture range is not rewritten yet.
+  static std::atomic<uint64_t> checked{0}, mismatched{0};
+  auto it = pending_detile_validations_.begin();
+  while (it != pending_detile_validations_.end()) {
+    if (it->buffer != reused_buffer) {
+      ++it;
+      continue;
+    }
+    const auto& reference = *it->texture->detile_reference;
+    const size_t size = std::min(reference.size(), it->texture->converted_payload_size);
+    const bool equal = !std::memcmp(reference.data(), it->mapping, size);
+    const uint64_t count = ++checked;
+    if (!equal) {
+      const uint64_t bad = ++mismatched;
+      size_t first = 0;
+      while (first < size && reference[first] == it->mapping[first]) ++first;
+      if (bad <= 32) {
+        REXLOG_WARN("gta4-native-detile: MISMATCH texture {:08X} format={} {}x{} tiled={} "
+                    "endian={} jobs={} first-diff={} of {}",
+                    it->texture->handle, uint32_t(it->texture->info.format),
+                    it->texture->info.width + 1, it->texture->info.height + 1,
+                    it->texture->info.is_tiled, uint32_t(it->texture->info.endianness),
+                    it->texture->detile_jobs.size(), first, size);
+      }
+    }
+    if (count % 256 == 0) {
+      REXLOG_WARN("gta4-native-detile: validated {} textures, {} mismatched", count,
+                  mismatched.load());
+    }
+    it = pending_detile_validations_.erase(it);
+  }
 }
 
 bool Gta4NativeGraphicsSystem::EnsureIndexedDescriptorPages(uint32_t page_count) {
@@ -16725,6 +17093,9 @@ bool Gta4NativeGraphicsSystem::InitializeNativeRendererObjects() {
     DestroyNativeRendererObjects();
     return false;
   }
+  if (!CreateTextureDetileObjects()) {
+    REXLOG_WARN("gta4-native: GPU texture detiling unavailable; textures convert on the CPU");
+  }
   native_pipeline_compiler_ = std::make_unique<NativePipelineCompilerState>();
   native_pipeline_compiler_->writer = std::make_unique<NativePipelineCompilerState::Writer>(1);
   native_pipeline_compiler_->checkpoint_tick.store(rex::chrono::Clock::QueryHostTickCount());
@@ -17221,6 +17592,7 @@ bool Gta4NativeGraphicsSystem::EnsureFrameUploadCapacity(
       return;
     }
     add_allocation(VkDeviceSize(texture->payload.size()), 16);
+    if (!texture->detile_jobs.empty()) add_allocation(VkDeviceSize(texture->converted_payload_size), 16);
   };
   add_texture(present_source);
 
@@ -17469,6 +17841,7 @@ bool Gta4NativeGraphicsSystem::EnsureFrameUploadCapacityFast(
       return;
     }
     add_allocation(VkDeviceSize(texture->payload.size()), 16);
+    if (!texture->detile_jobs.empty()) add_allocation(VkDeviceSize(texture->converted_payload_size), 16);
   };
   add_texture(present_source);
 
@@ -18322,11 +18695,27 @@ Gta4NativeGraphicsSystem::NativeTextureImage* Gta4NativeGraphicsSystem::GetOrCre
   std::optional<NativeTextureUploadBatch::Upload> pending_upload;
   if (!texture->gpu_produced) {
     NativeUploadAllocation upload;
-    if (!AllocateUpload(texture->payload.size(), 16, upload, NativeUploadKind::kTexture)) {
-      DestroyNativeTextureImage(*image);
-      return reject("upload-allocation");
+    if (!texture->detile_jobs.empty()) {
+      // Raw guest bytes in, converted texels out (at the offsets the copies
+      // below use), on the GPU.
+      NativeUploadAllocation raw;
+      if (!AllocateUpload(texture->payload.size(), 16, raw, NativeUploadKind::kTexture) ||
+          !AllocateUpload(texture->converted_payload_size, 16, upload, NativeUploadKind::kTexture)) {
+        DestroyNativeTextureImage(*image);
+        return reject("upload-allocation");
+      }
+      std::memcpy(raw.mapping, texture->payload.data(), texture->payload.size());
+      if (!RecordTextureDetile(command_buffer, texture, raw, upload)) {
+        DestroyNativeTextureImage(*image);
+        return reject("gpu-detile");
+      }
+    } else {
+      if (!AllocateUpload(texture->payload.size(), 16, upload, NativeUploadKind::kTexture)) {
+        DestroyNativeTextureImage(*image);
+        return reject("upload-allocation");
+      }
+      std::memcpy(upload.mapping, texture->payload.data(), texture->payload.size());
     }
-    std::memcpy(upload.mapping, texture->payload.data(), texture->payload.size());
 
     std::vector<VkBufferImageCopy> copies;
     copies.reserve(texture->mip_levels.size());
@@ -21178,8 +21567,16 @@ VkPipeline Gta4NativeGraphicsSystem::GetOrCreateDrawPipeline(
   const bool trace_pipeline =
       ShouldCaptureArtificialLightFrame(diagnostic_submitted_frame_) &&
       (diagnostic_light_trace_id_ || IsArtificialLightRenderPhase(diagnostic_render_phase_));
+  const uint64_t memo_signature = command.pipeline_memo_signature;
+  if (!trace_pipeline && !target.temporal_shader && memo_signature) {
+    if (VkPipeline pipeline =
+            state.pipeline_lookup_memo.FindSigned(&state, memo_signature, context)) {
+      AddNativeGpuProfileCounter(performance::Counter::kPipelineRequestReuses);
+      return pipeline;
+    }
+  }
   const auto memo_state = NativePipelineMemoState(command.fixed_function_state);
-  if (!trace_pipeline && !target.temporal_shader) {
+  if (!trace_pipeline && !target.temporal_shader && !memo_signature) {
     if (VkPipeline pipeline =
             state.pipeline_lookup_memo.Find(&state, memo_state, context)) {
       AddNativeGpuProfileCounter(performance::Counter::kPipelineRequestReuses);
@@ -21229,7 +21626,8 @@ VkPipeline Gta4NativeGraphicsSystem::GetOrCreateDrawPipeline(
   VkPipeline pipeline = GetOrCreatePipeline(state, command.fixed_function_state, primitive_type,
                                               target, user_pointer_stride,
                                               primitive_restart_enable, prewarm);
-  if (!target.temporal_shader) state.pipeline_lookup_memo.Store(&state, memo_state, context, pipeline);
+  if (!target.temporal_shader)
+    state.pipeline_lookup_memo.Store(&state, memo_state, context, pipeline, memo_signature);
   if (cache_entry && pipeline) {
     cache_entry->vertex_shader = state.vertex_shader_resource;
     cache_entry->pixel_shader = state.pixel_shader_resource;
@@ -22190,7 +22588,28 @@ bool Gta4NativeGraphicsSystem::UploadBufferResource(
     return false;
   }
 
+  // A buffer whose memo already names its persistent GPU copy needs neither the
+  // frame's upload map nor the persistent map: mark the copy used and bind it.
+  const bool memo_first = command_buffer && REXCVAR_GET(gta4_native_upload_memo_first) &&
+                          REXCVAR_GET(gta4_native_persistent_buffers);
   if (index_buffer) {
+    if (memo_first) {
+      const std::vector<uint8_t>& host =
+          index32 ? resource->host_index32_payload : resource->host_index16_payload;
+      NativePersistentBufferKey memo_key{};
+      memo_key.generation = resource->generation;
+      memo_key.kind =
+          index32 ? NativePersistentBufferKind::kIndex32 : NativePersistentBufferKind::kIndex16;
+      if (!host.empty()) {
+        if (NativePersistentBufferEntry* entry = UsePersistentMemo(*resource, memo_key)) {
+          allocation = {};
+          allocation.buffer = entry->buffer;
+          allocation.offset = entry->offset;
+          allocation.host_data = host.data();
+          return true;
+        }
+      }
+    }
     auto& uploads = index32 ? resources.index32_uploads : resources.index16_uploads;
     const auto* existing = uploads.Find(resource->generation);
     if (existing) {
@@ -22244,6 +22663,14 @@ bool Gta4NativeGraphicsSystem::UploadBufferResource(
   persistent_key.stream_offset = stream_state.offset;
   persistent_key.stride = stream_state.stride;
   persistent_key.kind = NativePersistentBufferKind::kVertex;
+  if (memo_first) {
+    if (NativePersistentBufferEntry* entry = UsePersistentMemo(*resource, persistent_key)) {
+      allocation = {};
+      allocation.buffer = entry->buffer;
+      allocation.offset = entry->offset;
+      return true;
+    }
+  }
   auto& uploads = resources.vertex_uploads;
   if (const auto* existing = uploads.Find(persistent_key)) {
     allocation = *existing;
@@ -22365,31 +22792,49 @@ void Gta4NativeGraphicsSystem::ObserveNativeGpuProfileDraw(
 bool Gta4NativeGraphicsSystem::BindUboConstantBanks(VkCommandBuffer command_buffer,
                                                     VkPipelineLayout layout,
                                                     const NativeUploadAllocation& vertex,
-                                                    const NativeUploadAllocation& pixel) {
+                                                    const NativeUploadAllocation& pixel,
+                                                    const NativeUploadAllocation& shared) {
   if (active_frame_slot_ >= ubo_constants_sets_.size() || !ubo_constants_sets_[active_frame_slot_]) {
     return true;  // Layout without the uniform banks: nothing to bind.
   }
   const NativeFrameConstantArena& arena = frame_constant_arenas_[active_frame_slot_];
   // Worker ring allocations use the ring's own set (written once at start).
-  const bool ring = worker_ring_ubo_set_ && worker_constant_ring_.buffer &&
+  const bool ring = worker_ring_ubo_sets_[active_frame_slot_] && worker_constant_ring_.buffer &&
                     vertex.buffer == worker_constant_ring_.buffer &&
                     pixel.buffer == worker_constant_ring_.buffer;
   if (!ring && (!arena.storage.buffer || vertex.buffer != arena.storage.buffer ||
                 pixel.buffer != arena.storage.buffer)) {
     return false;
   }
+  // The shared constants always come from the slot's arena.
+  if (!arena.storage.buffer || shared.buffer != arena.storage.buffer) return false;
   auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
   const ui::vulkan::VulkanDevice* vulkan_device = vulkan_provider->vulkan_device();
   const auto& dfn = vulkan_device->functions();
-  const VkDescriptorSet set = ring ? worker_ring_ubo_set_ : ubo_constants_sets_[active_frame_slot_];
+  const VkDescriptorSet set =
+      ring ? worker_ring_ubo_sets_[active_frame_slot_] : ubo_constants_sets_[active_frame_slot_];
+  if (ring && worker_ring_set_shared_buffers_[active_frame_slot_] != arena.storage.buffer) {
+    // Same rule as below: the slot has no work in flight when its arena changes.
+    VkDescriptorBufferInfo shared_info{arena.storage.buffer, 0, sizeof(NativeSharedConstants)};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = set;
+    write.dstBinding = 2;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+    write.pBufferInfo = &shared_info;
+    dfn.vkUpdateDescriptorSets(vulkan_device->device(), 1, &write, 0, nullptr);
+    worker_ring_set_shared_buffers_[active_frame_slot_] = arena.storage.buffer;
+    ubo_bound_layout_ = VK_NULL_HANDLE;
+  }
   if (!ring && ubo_constants_set_buffers_[active_frame_slot_] != arena.storage.buffer) {
     // The arena is replaced only while this slot has no work in flight, and
     // this slot's previous submission completed before recording restarted.
-    std::array<VkDescriptorBufferInfo, 2> buffers{};
+    std::array<VkDescriptorBufferInfo, 3> buffers{};
     buffers[0] = {arena.storage.buffer, 0, kVertexConstantsSize};
     buffers[1] = {arena.storage.buffer, 0, kPixelConstantsSize};
-    std::array<VkWriteDescriptorSet, 2> writes{};
-    for (uint32_t index = 0; index < 2; ++index) {
+    buffers[2] = {arena.storage.buffer, 0, sizeof(NativeSharedConstants)};
+    std::array<VkWriteDescriptorSet, 3> writes{};
+    for (uint32_t index = 0; index < 3; ++index) {
       writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
       writes[index].dstSet = set;
       writes[index].dstBinding = index;
@@ -22402,7 +22847,8 @@ bool Gta4NativeGraphicsSystem::BindUboConstantBanks(VkCommandBuffer command_buff
     ubo_constants_set_buffers_[active_frame_slot_] = arena.storage.buffer;
     ubo_bound_layout_ = VK_NULL_HANDLE;
   }
-  const std::array<uint32_t, 2> offsets = {uint32_t(vertex.offset), uint32_t(pixel.offset)};
+  const std::array<uint32_t, 3> offsets = {uint32_t(vertex.offset), uint32_t(pixel.offset),
+                                          uint32_t(shared.offset)};
   if (!REXCVAR_GET(gta4_native_ubo_bind_always) && ubo_bound_layout_ == layout &&
       ubo_bound_set_ == set && ubo_bound_offsets_ == offsets &&
       ubo_bound_command_buffer_ == command_buffer) {
@@ -22580,7 +23026,7 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
       command.pipeline_state && command.pipeline_state->vertex_shader_resource
           ? command.pipeline_state->vertex_shader_resource->hash
           : 0;
-  if (gpu_flight::IsEnabled()) {
+  if (native_flight_enabled_.load(std::memory_order_relaxed)) {
     const uint64_t submission = submission_tracker_ ? submission_tracker_->GetCurrentSubmission() : 0;
     gpu_flight::Record("native.draw-pipeline", NativeVulkanHandleIdentity(pipeline), submission,
                        diagnostic_submitted_frame_, diagnostic_command_index_,
@@ -22682,11 +23128,21 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
       command.shader_state->versions.Get(DirtyStateComponent::kBooleanConstants);
   shared_key.image_descriptor_epoch = command.image_descriptor_epoch;
   shared_key.sampler_descriptor_epoch = command.sampler_descriptor_epoch;
-  for (uint32_t stage = 0; stage < kShaderTextureCount; ++stage) {
+  // Only stages a shader of this draw samples: the others' biases are never
+  // read (they stay zero in the key), and walking all 26 touched every
+  // texture slot and fetch constant of the command.
+  const auto* vertex_shader = command.pipeline_state ? command.pipeline_state->vertex_shader_resource : nullptr;
+  const auto* pixel_shader = command.pipeline_state ? command.pipeline_state->pixel_shader_resource : nullptr;
+  const uint32_t vertex_textures = vertex_shader
+      ? vertex_shader->used_texture_mask | vertex_shader->override_used_texture_mask : 0;
+  const uint32_t pixel_textures = pixel_shader
+      ? pixel_shader->used_texture_mask | pixel_shader->override_used_texture_mask : 0;
+  uint32_t bias_stages = command.used_texture_mask | vertex_textures | pixel_textures;
+  if (!REXCVAR_GET(gta4_native_sampled_stage_biases)) bias_stages = (1u << kShaderTextureCount) - 1;
+  for (uint32_t mask = bias_stages; mask; mask &= mask - 1) {
+    const uint32_t stage = uint32_t(std::countr_zero(mask));
+    if (stage >= kShaderTextureCount) break;
     const auto& texture = command.textures[stage];
-    const auto* vertex_shader = command.pipeline_state ? command.pipeline_state->vertex_shader_resource : nullptr;
-    const uint32_t vertex_textures = vertex_shader
-        ? vertex_shader->used_texture_mask | vertex_shader->override_used_texture_mask : 0;
     const bool material = target.temporal_jitter && texture && texture->mip_levels.size() > 1 &&
         texture->info.dimension == xenos::DataDimension::k2DOrStacked && !texture->gpu_produced &&
         !texture->virtual_lifetime && !texture->vector_font_replacement &&
@@ -22762,7 +23218,15 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
     return false;
   }
   NativeFrameConstantArena& constant_arena = frame_constant_arenas_[active_frame_slot_];
-  uint64_t* shared_identity = constant_arena.shared_versions.Find(shared_key);
+  uint64_t remembered_identity = 0;
+  uint64_t* shared_identity = nullptr;
+  if (constant_arena.last_shared_identity && REXCVAR_GET(gta4_native_shared_key_memo) &&
+      shared_key == constant_arena.last_shared_key) {
+    remembered_identity = constant_arena.last_shared_identity;
+    shared_identity = &remembered_identity;
+  } else {
+    shared_identity = constant_arena.shared_versions.Find(shared_key);
+  }
   if (!shared_identity) {
     if (!constant_arena.next_shared_identity ||
         constant_arena.next_shared_identity == std::numeric_limits<uint64_t>::max()) {
@@ -22774,6 +23238,10 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
       return false;
     }
     shared_identity = insertion.value;
+  }
+  if (shared_identity != &remembered_identity) {
+    constant_arena.last_shared_key = shared_key;
+    constant_arena.last_shared_identity = *shared_identity;
   }
   if (!FindFrameConstantBuffer(NativeConstantBufferKind::kShared, *shared_identity,
                                shared_constants_allocation)) {
@@ -23099,7 +23567,8 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
   }
   if (!target.temporal_shader && !BindUboConstantBanks(command_buffer, draw_pipeline_layout,
                                                        vertex_constants_allocation,
-                                                       pixel_constants_allocation)) {
+                                                       pixel_constants_allocation,
+                                                       shared_constants_allocation)) {
     return false;
   }
   #include "bulb_appearance_bind.inc"
@@ -23968,9 +24437,27 @@ bool Gta4NativeGraphicsSystem::RecordIndexedPrimitive(VkCommandBuffer command_bu
         key.stream_offset = draw.start_index;
         key.stride = draw.index_count;
         NativeUploadAllocation reordered_allocation{};
-        if (GetOrCreatePersistentBuffer(command_buffer, command.index_buffer, key,
-                                        reordered->data(), VkDeviceSize(reordered->size()),
-                                        NativeUploadKind::kIndex, reordered_allocation)) {
+        // The range keeps its own memo: through the index buffer's memo the
+        // reordered copy and the plain index buffer evicted each other on
+        // every draw, sending both to the persistent map.
+        NativeVertexCacheRange& range = *found->second;
+        bool reordered_ready = false;
+        if (range.persistent_entry && range.persistent_epoch == persistent_buffer_epoch_ &&
+            REXCVAR_GET(gta4_native_upload_memo_first)) {
+          auto& entry = *static_cast<NativePersistentBufferEntry*>(range.persistent_entry);
+          TouchPersistentEntry(entry);
+          reordered_allocation.buffer = entry.buffer;
+          reordered_allocation.offset = entry.offset;
+          reordered_ready = true;
+        } else if (GetOrCreatePersistentBuffer(command_buffer, command.index_buffer, key,
+                                               reordered->data(), VkDeviceSize(reordered->size()),
+                                               NativeUploadKind::kIndex, reordered_allocation)) {
+          // Both the hit and the insertion leave the owner's memo on this key.
+          range.persistent_entry = command.index_buffer->persistent_memo_entry;
+          range.persistent_epoch = command.index_buffer->persistent_memo_epoch;
+          reordered_ready = true;
+        }
+        if (reordered_ready) {
           selected_index_bytes = reordered->data();
           g_vertex_cache_reordered_draws.fetch_add(1, std::memory_order_relaxed);
           host_start_index = 0;
@@ -24327,6 +24814,39 @@ bool Gta4NativeGraphicsSystem::RecordIndexedPrimitive(VkCommandBuffer command_bu
     }
   }
   ObserveNativeGpuProfileDraw(command, pipeline, target.samples, 0, host_index_count);
+  if (REXCVAR_GET(gta4_native_gpu_breadcrumbs) && selected_index_bytes && host_index_count) {
+    // Diagnostics: an index past the end of a vertex stream makes the GPU
+    // fetch outside the buffer (suspected cause of shadow-pass GPU hangs).
+    uint32_t max_index = 0;
+    for (uint32_t i = 0; i < host_index_count; ++i) {
+      const uint32_t value = index32 ? reinterpret_cast<const uint32_t*>(selected_index_bytes)[i]
+                                     : reinterpret_cast<const uint16_t*>(selected_index_bytes)[i];
+      if (guest_restart_enabled && value == (index32 ? 0xFFFFFFFFu : 0xFFFFu)) continue;
+      max_index = std::max(max_index, value);
+    }
+    const int64_t last_vertex = int64_t(max_index) + int64_t(draw.base_vertex);
+    for (uint32_t stream = 0; stream < kVertexStreamCount; ++stream) {
+      if (!required_streams[stream]) continue;
+      const auto& stream_state = command.pipeline_state->vertex_streams[stream];
+      const auto& resource = command.vertex_buffers[stream];
+      if (!stream_state.stride || !resource) continue;
+      const int64_t vertices =
+          (int64_t(resource->payload.size()) - int64_t(stream_state.offset)) / stream_state.stride;
+      if (last_vertex >= vertices || last_vertex < 0) {
+        static std::atomic<uint32_t> reported{0};
+        if (++reported <= 40) {
+          REXLOG_WARN("gta4-native-oob: draw prim {} start {} count {} base {} max-index {} -> vertex "
+                      "{} >= {} (stream {} stride {} offset {} vb {:08X}@{} {}b) vs={:016X}",
+                      draw.primitive_type, draw.start_index, host_index_count, draw.base_vertex,
+                      max_index, last_vertex, vertices, stream, stream_state.stride,
+                      stream_state.offset, resource->handle, resource->generation,
+                      resource->payload.size(),
+                      command.pipeline_state->vertex_shader_resource
+                          ? command.pipeline_state->vertex_shader_resource->hash : 0);
+        }
+      }
+    }
+  }
   profile::CpuCall(profile::CpuOp::kDriverDraw, [&] { if (!REXCVAR_GET(gta4_native_debug_gpu_attribution) || REXCVAR_GET(gta4_native_debug_gpu_attribution) == 1) dfn.vkCmdDrawIndexed(command_buffer, host_index_count, 1, host_start_index, draw.base_vertex, 0); });
   TraceModernShaderDraw(command, target);
   return true;
@@ -29151,9 +29671,33 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
   const auto restore_gpu_summary = MakeScopeExit([&] { native_gpu_scope_summary_ = previous_gpu_summary; });
   NativeProducerDepthResolve producer_depth_resolve{};
   NativeProducerDepthResolveScan producer_depth_resolve_scan{};
+  const bool breadcrumbs = REXCVAR_GET(gta4_native_gpu_breadcrumbs);
+  size_t breadcrumb_command = 0, breadcrumb_scope_begin = 0;
   const auto end_rendering = [&](int site = 0) {
     if (site > 0 && site < int(g_rendering_end_sites.size())) ++g_rendering_end_sites[site];
     profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdEndRendering(command_buffer); });
+    if (breadcrumbs) {
+      // Label: the scope that just ended is complete once this marker lands;
+      // the label names the work that follows it (the next scope's commands).
+      uint32_t draws = 0;
+      uint64_t vs = 0, ps = 0;
+      for (size_t i = breadcrumb_scope_begin; i <= breadcrumb_command && i < current_frame_.size(); ++i) {
+        const NativeCommand& c = current_frame_[i];
+        if (c.type != CommandType::kDrawPrimitive && c.type != CommandType::kDrawIndexedPrimitive &&
+            c.type != CommandType::kDrawPrimitiveUp) continue;
+        ++draws;
+        if (c.pipeline_state && !vs) {
+          vs = c.pipeline_state->vertex_shader_resource ? c.pipeline_state->vertex_shader_resource->hash : 0;
+          ps = c.pipeline_state->pixel_shader_resource ? c.pipeline_state->pixel_shader_resource->hash : 0;
+        }
+      }
+      WriteBreadcrumb(command_buffer,
+                      fmt::format("after scope cmds {}-{} ({} draws, {}x{} samples {}, first vs={:016X} "
+                                  "ps={:016X}, end site L{}); next: commands from {}",
+                                  breadcrumb_scope_begin, breadcrumb_command, draws, active_target.width,
+                                  active_target.height, uint32_t(active_target.samples), vs, ps, site,
+                                  breadcrumb_command + 1));
+    }
     gpu_labels::End(vulkan_provider->vulkan_device(), command_buffer);
     if (profile_scopes) gpu_labels::EndSceneScope(vulkan_provider->vulkan_device(), command_buffer, *native_gpu_scope_summary_);
     CompleteProducerDepthResolve(command_buffer, producer_depth_resolve);
@@ -30655,6 +31199,7 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
     if (const auto* state = ahead.shader_state.get()) __builtin_prefetch(state);
   };
   for (size_t command_index = 0; command_index < current_frame_.size(); ++command_index) {
+    breadcrumb_command = command_index;
     if (prefetch_commands) {
       if (command_index + 4 < current_frame_.size()) prefetch_command(current_frame_[command_index + 4]);
       if (command_index + 2 < current_frame_.size()) prefetch_state(current_frame_[command_index + 2]);
@@ -34537,6 +35082,7 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
         presenter_written = true;
       }
       active_target = target;
+      breadcrumb_scope_begin = command_index;
     }
 
     uint32_t translucent_query_index = UINT32_MAX;
@@ -34772,6 +35318,7 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
       raster_command.fixed_function_state.stencil_enable = 0;
       raster_command.fixed_function_state.stencil_function = 0;
       raster_command.fixed_function_state.ccw_stencil_function = 0;
+      raster_command.pipeline_memo_signature = 0;
       const uint32_t raster_query = begin_translucent_query(raster_command, "prelight-raster");
       const bool raster_recorded = record_diagnostic_draw(raster_command);
       end_translucent_query(raster_query, raster_recorded);
@@ -35507,6 +36054,22 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
         }
       }
       trace_deferred_light_draw(command_recorded);
+      if (breadcrumbs && command_recorded) {
+        DrawIndexedPrimitiveCommand draw{};
+        std::memcpy(&draw, command.bytes.data(), std::min(sizeof(draw), command.bytes.size()));
+        const auto* vs = command.pipeline_state ? command.pipeline_state->vertex_shader_resource : nullptr;
+        const auto* ps = command.pipeline_state ? command.pipeline_state->pixel_shader_resource : nullptr;
+        WriteBreadcrumb(command_buffer,
+                        fmt::format("after draw cmd {} (merged {}): prim {} start {} count {} base {} "
+                                    "ib {:08X}@{} {}b size {} vs={:016X} ps={:016X}",
+                                    command_index, merged_count, draw.primitive_type, draw.start_index,
+                                    merged_count > 1 ? merged_indices : draw.index_count, draw.base_vertex,
+                                    command.index_buffer ? command.index_buffer->handle : 0,
+                                    command.index_buffer ? command.index_buffer->generation : 0,
+                                    command.index_buffer && (command.index_buffer->flags & kIndex32Flag) ? 32 : 16,
+                                    command.index_buffer ? command.index_buffer->payload.size() : 0,
+                                    vs ? vs->hash : 0, ps ? ps->hash : 0));
+      }
       if (collect_frame_diagnostics) {
         command_recorded ? ++successful_draws : ++failed_draws;
       }
@@ -36445,6 +37008,7 @@ bool Gta4NativeGraphicsSystem::PublishFrame(
     const PresentCommand& present,
     const std::shared_ptr<const NativeTextureResource>& present_source,
     const std::shared_ptr<const EnvironmentalDataV2>& environmental_data) {
+  native_flight_enabled_.store(gpu_flight::IsEnabled(), std::memory_order_relaxed);
   const bool detail_requested = CachedDiagnosticsEnabled(rex::diagnostics::Category::kNativeProfiler) &&
       !native_gpu_profile_state_.capture_complete && !native_gpu_profile_state_.export_started &&
       (REXCVAR_GET(gta4_profile_native_autostart) || native_gpu_profile_state_.capture_armed ||
@@ -36981,6 +37545,8 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutput(
         if (!RecordNullImageInitialization(command_buffer_)) {
           return false;
         }
+        if (!pending_detile_validations_.empty()) CheckTextureDetileValidations(upload_buffer_.buffer);
+        CheckBreadcrumbs();
         std::memset(upload_buffer_.mapping, 0, size_t(kDefaultVertexDataSize));
         upload_buffer_.write_offset = kDefaultVertexDataSize;
         for (NativeUploadBuffer& overflow : overflow_upload_buffers_) {
@@ -37041,6 +37607,11 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutput(
         const uint64_t native_profile_record_begin =
             native_profile_frame_started ? rex::chrono::Clock::QueryHostTickCount() : 0;
         SwitchNativeGpuProfileRange(command_buffer_, performance::GpuRange::kUnattributed);
+        if (REXCVAR_GET(gta4_native_gpu_breadcrumbs) && active_frame_slot_ < breadcrumb_frames_.size()) {
+          breadcrumb_frames_[active_frame_slot_].frame = submitted_frame & 0xFFFF;
+          WriteBreadcrumb(command_buffer_, fmt::format("frame {} start: textures prepared, recording begins",
+                                                       submitted_frame));
+        }
         const bool frame_recorded = RecordNativeFrame(
             command_buffer_, width, height, vulkan_context.image(), vulkan_context.image_view(),
             submitted_frame, present_source, environmental_data, vulkan_context.hdr_output(),
@@ -37055,6 +37626,9 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutput(
               present.submitted_frame, present.diagnostic_origin, present.diagnostic_guest_caller,
               frame_recorded, bool(present_source), presenter_written, presenter_transfer_written,
               current_frame_.size(), active_frame_slot_);
+        }
+        if (REXCVAR_GET(gta4_native_gpu_breadcrumbs)) {
+          WriteBreadcrumb(command_buffer_, "frame end (release, submit)");
         }
         if (native_profile_frame_started) {
           native_gpu_profile_state_.frames[active_frame_slot_].cpu_record_ticks =
@@ -37531,6 +38105,16 @@ void Gta4NativeGraphicsSystem::DestroyNativeRendererObjects() {
   if (packed_depth_stencil_sampler_) {
     profile::CpuCall(profile::CpuOp::kDriverDestruction, [&] { return dfn.vkDestroySampler(device, packed_depth_stencil_sampler_, nullptr); });
     packed_depth_stencil_sampler_ = VK_NULL_HANDLE;
+  }
+  texture_detile_available_.store(false, std::memory_order_release);
+  pending_detile_validations_.clear();
+  if (texture_detile_pipeline_) {
+    dfn.vkDestroyPipeline(device, texture_detile_pipeline_, nullptr);
+    texture_detile_pipeline_ = VK_NULL_HANDLE;
+  }
+  if (texture_detile_pipeline_layout_) {
+    dfn.vkDestroyPipelineLayout(device, texture_detile_pipeline_layout_, nullptr);
+    texture_detile_pipeline_layout_ = VK_NULL_HANDLE;
   }
   if (pipeline_layout_) {
     profile::CpuCall(profile::CpuOp::kDriverDestruction, [&] { return dfn.vkDestroyPipelineLayout(device, pipeline_layout_, nullptr); });

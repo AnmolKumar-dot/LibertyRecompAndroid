@@ -36,6 +36,7 @@ set(GTA4_APP_SOURCES
     src/gta4_online_hooks.cpp
     src/gta4_native_hooks.cpp
     src/gta4_population_hooks.cpp
+    src/gta4_hack_registry.cpp
     src/gta4_streaming_diagnostics.cpp
     src/gta4_streaming_hooks.cpp
     src/gta4_touch_coordinator.cpp
@@ -401,7 +402,8 @@ elseif(ANDROID)
     target_sources(LibertyRecomp PRIVATE src/android/android_pgo_dump.cpp
         src/android/android_frame_wait_hook.cpp
         src/android/android_stale_object_guard.cpp
-        src/android/android_thread_pinning.cpp)
+        src/android/android_thread_pinning.cpp
+        src/android/android_power.cpp)
     # The launcher's installer: the same source inspection and installation
     # code as the in-game installer dialog, without the rest of the title, so
     # the launcher process can install the game before it ever starts.

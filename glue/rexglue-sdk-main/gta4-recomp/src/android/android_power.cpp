@@ -145,7 +145,10 @@ void PowerLoop() {
   const Api api = LoadApi();
   const bool hints = api.get_manager && api.create_session && api.update_target &&
                      api.report_actual && api.close_session;
-  AThermalManager* thermal = api.thermal_acquire ? api.thermal_acquire() : nullptr;
+  // AThermal_acquireManager is API 30, AThermal_getThermalHeadroom API 31:
+  // Android 11 has the manager without the headroom (issue #58).
+  AThermalManager* thermal =
+      api.thermal_acquire && api.thermal_headroom ? api.thermal_acquire() : nullptr;
   APerformanceHintManager* manager = hints ? api.get_manager() : nullptr;
   __android_log_print(ANDROID_LOG_WARN, "LibertyRecomp", "power: performance hints %s, thermal headroom %s",
                       manager ? "available" : "unavailable", thermal ? "available" : "unavailable");

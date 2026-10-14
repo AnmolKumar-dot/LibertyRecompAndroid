@@ -116,7 +116,7 @@ public class LibertyActivity extends SDLActivity {
         writeLaunchReport(status, reason);
         if (reason != null) {
             throw new UnsatisfiedLinkError(reason
-                    + "\n\nSupported GPUs: Qualcomm Adreno 6xx and 7xx."
+                    + "\n\nSupported GPUs: Qualcomm Adreno 6xx and 7xx, ARM Mali (experimental)."
                     + "\nA report was saved to Android/data/" + getPackageName()
                     + "/files/" + LAUNCH_REPORT + ".");
         }

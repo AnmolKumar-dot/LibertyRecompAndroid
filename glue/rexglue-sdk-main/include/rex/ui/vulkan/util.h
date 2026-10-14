@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <vector>
 
 #include <rex/math.h>
 #include <rex/ui/vulkan/device.h>
@@ -138,10 +139,23 @@ bool CreateDedicatedAllocationImage(const VulkanDevice* vulkan_device,
                                     VkDeviceMemory& memory_out, uint32_t* memory_type_out = nullptr,
                                     VkDeviceSize* memory_size_out = nullptr);
 
+// For devices without shaderClipDistance/shaderCullDistance (ARM Mali): turns
+// every clip and cull distance output into an ordinary output at a free
+// location that no later stage reads, and drops the capability. The geometry
+// is then not clipped by those planes. Returns false when the module needs no
+// change or cannot be rewritten safely; the original code is used then.
+bool RewriteUnsupportedClipCullDistances(const VulkanDevice* vulkan_device, const uint32_t* code,
+                                         size_t code_size_bytes, std::vector<uint32_t>& rewritten);
+
 // Explicitly accepting const uint32_t* to make sure attention is paid to the
 // alignment where this is called for safety on different host architectures.
 inline VkShaderModule CreateShaderModule(const VulkanDevice* const vulkan_device,
-                                         const uint32_t* const code, const size_t code_size_bytes) {
+                                         const uint32_t* code, size_t code_size_bytes) {
+  std::vector<uint32_t> rewritten;
+  if (RewriteUnsupportedClipCullDistances(vulkan_device, code, code_size_bytes, rewritten)) {
+    code = rewritten.data();
+    code_size_bytes = rewritten.size() * sizeof(uint32_t);
+  }
   VkShaderModuleCreateInfo shader_module_create_info;
   shader_module_create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
   shader_module_create_info.pNext = nullptr;

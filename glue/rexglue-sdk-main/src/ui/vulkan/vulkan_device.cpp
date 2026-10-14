@@ -131,17 +131,20 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         properties.deviceName);
     return nullptr;
   }
-  if (with_native_shader_support &&
-      (!supported_features.shaderClipDistance || !supported_features.sampleRateShading)) {
-    // These capabilities are declared statically by the cached title vertex
-    // shaders and the per-sample fullscreen conversion shaders, respectively.
-    // A draw-time flag cannot make either shader interface legal without them.
-    REXLOG_WARN(
-        "Vulkan device '{}' lacks native shader capabilities: shaderClipDistance={}, "
-        "sampleRateShading={}",
-        properties.deviceName, supported_features.shaderClipDistance != VK_FALSE,
-        supported_features.sampleRateShading != VK_FALSE);
+  if (with_native_shader_support && !supported_features.sampleRateShading) {
+    // Declared statically by the per-sample fullscreen conversion shaders. A
+    // draw-time flag cannot make that shader interface legal without it.
+    REXLOG_WARN("Vulkan device '{}' lacks native shader capability sampleRateShading",
+                properties.deviceName);
     return nullptr;
+  }
+  if (with_native_shader_support && !supported_features.shaderClipDistance) {
+    // The cached title vertex shaders declare ClipDistance. Without it (ARM
+    // Mali) util::CreateShaderModule turns the clip output into an unread
+    // ordinary output, so title clip planes stop clipping.
+    REXLOG_WARN(
+        "Vulkan device '{}' lacks shaderClipDistance; title clip planes are not applied",
+        properties.deviceName);
   }
 
   if ((with_gpu_emulation || with_native_shader_support) &&

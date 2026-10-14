@@ -2906,7 +2906,51 @@ VkColorComponentFlags ConvertColorWriteMask(uint32_t mask) {
   return result;
 }
 
+// Set once the Vulkan device exists: the GPU cannot sample BC1/BC2/BC3 images
+// (no textureCompressionBC, as on ARM Mali), so the DXT formats are decoded to
+// R8G8B8A8 on the CPU when their payload is built.
+std::atomic<bool> g_decode_dxt_textures{false};
+// With DXT decoding: DXT1 goes to 16-bit A1R5G5B5 (enough for its 5:6:5
+// colors and 1-bit alpha) instead of R8G8B8A8 when the GPU can sample it.
+std::atomic<bool> g_decode_dxt1_to_a1r5g5b5{false};
+
+bool IsDecodedDxtFormat(xenos::TextureFormat base_format) {
+  return g_decode_dxt_textures.load(std::memory_order_relaxed) &&
+         (base_format == xenos::TextureFormat::k_DXT1 ||
+          base_format == xenos::TextureFormat::k_DXT2_3 ||
+          base_format == xenos::TextureFormat::k_DXT4_5 ||
+          base_format == xenos::TextureFormat::k_DXT3A);
+}
+
+void ConfigureDxtDecoding(const ui::vulkan::VulkanDevice* vulkan_device) {
+  constexpr VkFormatFeatureFlags kRequired =
+      VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+  const auto format_usable = [&](VkFormat format) {
+    VkFormatProperties properties{};
+    vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+        vulkan_device->physical_device(), format, &properties);
+    return (properties.optimalTilingFeatures & kRequired) == kRequired;
+  };
+  const bool supported = format_usable(VK_FORMAT_BC1_RGBA_UNORM_BLOCK) &&
+                         format_usable(VK_FORMAT_BC2_UNORM_BLOCK) &&
+                         format_usable(VK_FORMAT_BC3_UNORM_BLOCK);
+  const bool dxt1_16bit = !supported && format_usable(VK_FORMAT_A1R5G5B5_UNORM_PACK16);
+  g_decode_dxt_textures.store(!supported, std::memory_order_relaxed);
+  g_decode_dxt1_to_a1r5g5b5.store(dxt1_16bit, std::memory_order_relaxed);
+  if (!supported) {
+    REXLOG_WARN("gta4-native: the GPU cannot sample BC1/BC2/BC3; DXT textures are decoded on the "
+                "CPU (DXT1 to {}, DXT3/DXT5 to R8G8B8A8)",
+                dxt1_16bit ? "A1R5G5B5" : "R8G8B8A8");
+  }
+}
+
 VkFormat ConvertTextureFormat(xenos::TextureFormat format) {
+  if (IsDecodedDxtFormat(GetBaseFormat(format))) {
+    return GetBaseFormat(format) == xenos::TextureFormat::k_DXT1 &&
+                   g_decode_dxt1_to_a1r5g5b5.load(std::memory_order_relaxed)
+               ? VK_FORMAT_A1R5G5B5_UNORM_PACK16
+               : VK_FORMAT_R8G8B8A8_UNORM;
+  }
   switch (GetBaseFormat(format)) {
     case xenos::TextureFormat::k_8:
       return VK_FORMAT_R8_UNORM;
@@ -3819,6 +3863,8 @@ X_STATUS Gta4NativeGraphicsSystem::SetupPresentation(ui::WindowedAppContext* app
   if (!provider_) {
     return X_STATUS_UNSUCCESSFUL;
   }
+  ConfigureDxtDecoding(
+      static_cast<ui::vulkan::VulkanProvider*>(provider_.get())->vulkan_device());
 
   app_context_ = app_context;
   auto create_presenter = [this]() { presenter_ = provider_->CreatePresenter(); };
@@ -3850,6 +3896,8 @@ X_STATUS Gta4NativeGraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* fu
       memory_ = nullptr;
       return X_STATUS_UNSUCCESSFUL;
     }
+    ConfigureDxtDecoding(
+        static_cast<ui::vulkan::VulkanProvider*>(provider_.get())->vulkan_device());
   }
 
   StartRenderWorker();
@@ -5774,8 +5822,13 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
 
   const FormatInfo* guest_format_info = info.format_info();
   const xenos::TextureFormat base_format = GetBaseFormat(info.format);
+  const bool decode_dxt = IsDecodedDxtFormat(base_format);
+  const bool decode_dxt1_16bit = decode_dxt && base_format == xenos::TextureFormat::k_DXT1 &&
+                                 g_decode_dxt1_to_a1r5g5b5.load(std::memory_order_relaxed);
   const FormatInfo* host_format_info =
-      base_format == xenos::TextureFormat::k_DXT3A
+      decode_dxt1_16bit ? FormatInfo::Get(uint32_t(xenos::TextureFormat::k_1_5_5_5))
+      : decode_dxt     ? FormatInfo::Get(uint32_t(xenos::TextureFormat::k_8_8_8_8))
+      : base_format == xenos::TextureFormat::k_DXT3A
           ? FormatInfo::Get(uint32_t(xenos::TextureFormat::k_DXT2_3))
       : base_format == xenos::TextureFormat::k_CTX1 || base_format == xenos::TextureFormat::k_DXN
           ? FormatInfo::Get(uint32_t(xenos::TextureFormat::k_8_8))
@@ -5803,7 +5856,7 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
       texture_detile_available_.load(std::memory_order_acquire) && !vector_font_candidate &&
       base_format != xenos::TextureFormat::k_CTX1 && base_format != xenos::TextureFormat::k_DXN &&
       base_format != xenos::TextureFormat::k_DXT5A &&
-      base_format != xenos::TextureFormat::k_DXT3A &&
+      base_format != xenos::TextureFormat::k_DXT3A && !IsDecodedDxtFormat(base_format) &&
       guest_bytes_per_block == host_bytes_per_block && host_bytes_per_block >= 4 &&
       host_bytes_per_block <= 16;
   const bool cpu_convert = !gpu_detile || REXCVAR_GET(gta4_native_gpu_detile_validate);
@@ -5825,7 +5878,7 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
     info.GetMipSize(mip, &mip_width, &mip_height);
     const uint32_t mip_depth = is_3d ? std::max((info.depth + 1) >> mip, uint32_t(1)) : uint32_t(1);
     const TextureExtent guest_extent = info.GetMipExtent(mip, true);
-    const bool convert_block_to_pixels = base_format == xenos::TextureFormat::k_CTX1 ||
+    const bool convert_block_to_pixels = decode_dxt || base_format == xenos::TextureFormat::k_CTX1 ||
                                          base_format == xenos::TextureFormat::k_DXN ||
                                          base_format == xenos::TextureFormat::k_DXT5A;
     const uint32_t host_storage_width =
@@ -5975,7 +6028,25 @@ Gta4NativeGraphicsSystem::CaptureTextureResourceUncached(
                   size_t(block_x * guest_format_info->block_width) * host_bytes_per_block;
               const size_t destination_pitch =
                   size_t(host_extent.block_pitch_h) * host_bytes_per_block;
-              if (base_format == xenos::TextureFormat::k_CTX1) {
+              if (decode_dxt) {
+                void* const texels = destination + destination_offset;
+                if (decode_dxt1_16bit) {
+                  texture_conversion::ConvertTexelDXT1ToA1R5G5B5(info.endianness, texels,
+                                                                 source_block, destination_pitch);
+                } else if (base_format == xenos::TextureFormat::k_DXT1) {
+                  texture_conversion::ConvertTexelDXT1ToR8G8B8A8(info.endianness, texels,
+                                                                 source_block, destination_pitch);
+                } else if (base_format == xenos::TextureFormat::k_DXT2_3) {
+                  texture_conversion::ConvertTexelDXT2_3ToR8G8B8A8(
+                      info.endianness, texels, source_block, destination_pitch);
+                } else if (base_format == xenos::TextureFormat::k_DXT4_5) {
+                  texture_conversion::ConvertTexelDXT4_5ToR8G8B8A8(
+                      info.endianness, texels, source_block, destination_pitch);
+                } else {
+                  texture_conversion::ConvertTexelDXT3AToR8G8B8A8(info.endianness, texels,
+                                                                  source_block, destination_pitch);
+                }
+              } else if (base_format == xenos::TextureFormat::k_CTX1) {
                 texture_conversion::ConvertTexelCTX1ToR8G8(info.endianness,
                                                            destination + destination_offset,
                                                            source_block, destination_pitch);
@@ -20814,7 +20885,9 @@ Gta4NativeGraphicsSystem::NativeSurfaceImage* Gta4NativeGraphicsSystem::GetOrCre
 
   auto reject = [&descriptor, depth](const char* reason) -> NativeSurfaceImage* {
     static std::atomic<uint64_t> rejection_count{0};
-    const uint64_t count = NextNativeTraceDiagnosticCount(rejection_count);
+    // Not gated on the native-trace category: a surface that cannot be
+    // created is rare and breaks whatever reads it (first 32, then 1/1024).
+    const uint64_t count = rejection_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (count <= 32 || !(count % 1024)) {
       REXLOG_WARN(
           "gta4-native-diag: surface reject #{} reason={} depth={} handle={:08X} flags={:08X} "
@@ -20870,6 +20943,21 @@ Gta4NativeGraphicsSystem::NativeSurfaceImage* Gta4NativeGraphicsSystem::GetOrCre
 
   auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
   const ui::vulkan::VulkanDevice* vulkan_device = vulkan_provider->vulkan_device();
+  // The title's own 2x attachments: ARM Mali offers 1x/4x/8x/16x but no 2x,
+  // and the image could not be created (a black scene). Keep it multisampled
+  // at 4x where 2x is missing; 1x only if 4x is missing too.
+  if (!is_reflection && host_sample_override == VK_SAMPLE_COUNT_FLAG_BITS_MAX_ENUM &&
+      samples != VK_SAMPLE_COUNT_1_BIT) {
+    const auto& properties = vulkan_device->properties();
+    const VkSampleCountFlags supported_samples =
+        properties.framebufferColorSampleCounts & properties.framebufferDepthSampleCounts &
+        properties.framebufferStencilSampleCounts & properties.sampledImageColorSampleCounts &
+        properties.sampledImageDepthSampleCounts;
+    if (!(supported_samples & samples)) {
+      samples = (supported_samples & VK_SAMPLE_COUNT_4_BIT) ? VK_SAMPLE_COUNT_4_BIT
+                                                             : VK_SAMPLE_COUNT_1_BIT;
+    }
+  }
   if (!is_reflection && host_sample_override != VK_SAMPLE_COUNT_FLAG_BITS_MAX_ENUM) {
     const auto& properties = vulkan_device->properties();
     const VkSampleCountFlags supported_samples =

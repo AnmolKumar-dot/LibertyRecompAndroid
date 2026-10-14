@@ -64,7 +64,7 @@ Known problems:
 
 | | Requirement |
 |---|---|
-| **GPU** | **Qualcomm Adreno 6xx or 7xx** (Snapdragon). Developed and tested on the Adreno 650. **Adreno 8xx: experimental since 0.5.7.5**, see below. |
+| **GPU** | **Qualcomm Adreno 6xx or 7xx** (Snapdragon). Developed and tested on the Adreno 650. **Adreno 8xx: experimental since 0.5.7.5**, see below. **ARM Mali: very early experimental, not supported by the developer, since 0.5.9.3**, tested only on a Pixel 7, see below. |
 | **SoC** | Snapdragon 865 class or faster recommended (SD 865/870/888, 8 Gen 1/2/3, 8s Gen 3, …). |
 | **CPU** | arm64 with ARMv8.2-A (the build uses LSE atomics). ARMv8.0 chips such as the Snapdragon 835 crash on start. |
 | **Android** | Android 10 (API 29) or newer, 64-bit. |
@@ -74,15 +74,23 @@ Known problems:
 
 **Not supported:**
 
-- **ARM Mali / Immortalis GPUs.** This covers most Exynos chips before the 2200, MediaTek
-  Dimensity/Helio and Google Tensor.
 - **Samsung Xclipse GPUs** (Exynos 2200 and newer).
-- **PowerVR GPUs** and anything else that is not an Adreno.
+- **PowerVR GPUs**, Huawei Maleoon and anything else that is not an Adreno or a Mali.
 
-Why only Adreno: the renderer needs Vulkan 1.2 and was tuned on Turnip. Turnip is Mesa's open-source
+Why Adreno: the renderer needs Vulkan 1.2 and was tuned on Turnip. Turnip is Mesa's open-source
 Vulkan driver, and it exists only for Adreno GPUs. The stock Qualcomm driver on older devices
 (including the Adreno 650) exposes only Vulkan 1.1. On other GPUs the bundled driver cannot load,
-and nobody has run the renderer on their vendor drivers.
+so the game has to run on the vendor's own driver.
+
+**ARM Mali / Immortalis (most Exynos chips before the 2200, MediaTek Dimensity/Helio, Google
+Tensor): very early experimental state, not supported by the developer, since 0.5.9.3.** It has
+been tested only on a **Pixel 7** (Mali-G710) with the phone's own (System) driver: the game runs,
+but slowly and with audio stutter. Clip planes are skipped (some reflections may show extra
+geometry) and DXT textures are decoded on load (more memory, possible stutter while streaming).
+Mali support exists thanks to the
+[Mali fork](https://github.com/prollynotzjay/LibertyRecompAndroidMaliVer) and the patch in
+[#62](https://github.com/vaduur/LibertyRecompAndroid/issues/62). Issues opened for Mali devices
+may not be fixed.
 
 **Adreno 8xx (Snapdragon 8 Elite and newer): experimental, since 0.5.7.5.** The game has been
 started on an Adreno 840 (Samsung, Android 17). The bundled Turnip build does not support Adreno
@@ -92,7 +100,7 @@ how it runs in [Issues](https://github.com/vaduur/LibertyRecompAndroid/issues). 
 6xx parts (610/618/619) should start, but expect them to be far too slow.
 
 Since 0.5.6.2, when the bundled Turnip cannot drive the GPU, the app falls back to the device's own
-Vulkan driver if that driver offers Vulkan 1.2. This is untested on any GPU. If no usable driver
+Vulkan driver if that driver offers Vulkan 1.2. It has been tested only on the Mali-G710 above. If no usable driver
 exists, the app shows a dialog with the reason instead of closing silently, and it writes
 `Android/data/com.libertyrecomp/files/last_launch.txt` with the device, GPU and driver details.
 Attach that file when you report a problem.

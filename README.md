@@ -15,7 +15,7 @@ Mesa Turnip driver. There is no emulator in between.
 
 **DISCLAIMER!**
 
-!!! 10/16/2026 - On vacation until end of the month, fellas, now updates until then. Sowwy! Stick to forks and experimental settings until then, no issues will be sorted also. Touch grass like I do, it's necessary.  
+!!! 10/16/2026 - On vacation until end of the month, fellas, no updates until then. Sowwy! Stick to forks and experimental settings until then, no issues will be sorted also. Touch grass like I do, it's necessary.  
 
 This is pure 100% AI slop. I didn't made this by hand at all, it's all thanks to Claude and I, vaduur, take ZERO credit or responsibility of this port being unstable. It will run shitty, that's a guarantee. All I did is spent couple of sleepless night testing and pointing out the issues. Oh, yeah, and spent some pocket change on Claude sub ofc. Please be aware of it and feel free to fork this repo or use it as a reference in your future ReXGlue to Android ports. Thank you and have a nice day.
 

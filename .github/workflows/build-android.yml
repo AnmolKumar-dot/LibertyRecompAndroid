@@ -28,33 +28,41 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - name: Android SDK, platform 35 and NDK r29
+      - name: Android SDK platform 35 and NDK r29
         run: |
           SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager.bat"
           yes | "$SDKM" --licenses > /dev/null || true
           "$SDKM" --install "platforms;android-35" "ndk;29.0.14206865"
+          ls "$ANDROID_HOME/ndk"
+          echo "NDK_VER=29.0.14206865" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK=$(cygpath -w "$ANDROID_HOME/ndk/29.0.14206865")" >> "$GITHUB_ENV"
+          echo 'C:\Program Files\Git\usr\bin' >> "$GITHUB_PATH"
 
       - name: Tool versions
         run: |
           cmake --version
           ninja --version
           python --version
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_NDK=$ANDROID_NDK"
+          echo "JAVA_HOME=$JAVA_HOME"
+          which cygpath uname curl unzip || true
 
       - name: Repo setup (submodules, patches, vcpkg)
         run: python tools/setup_repo.py
 
       - name: Driver proxy
-        run: bash os/android/scripts/build_driver_proxy.sh
+        run: bash -x os/android/scripts/build_driver_proxy.sh
 
       - name: Native build
         env:
           STRIP: "1"
-        run: bash os/android/scripts/build_native.sh
+        run: bash -x os/android/scripts/build_native.sh
 
       - name: Package APK
         run: |
           rm -f os/android/app/build/outputs/apk/debug/app-debug.apk
-          bash os/android/scripts/build_apk.sh
+          bash -x os/android/scripts/build_apk.sh
 
       - uses: actions/upload-artifact@v4
         with:

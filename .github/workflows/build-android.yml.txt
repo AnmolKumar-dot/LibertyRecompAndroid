@@ -1,0 +1,137 @@
+name: Android Build
+
+# Builds the Android APK and stages native libraries as described in docs/android/BUILDING.md.
+
+on:
+  push:
+    branches: [main, beta]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'README*'
+      - 'LICENSE*'
+      - '.gitignore'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'README*'
+      - 'LICENSE*'
+      - '.gitignore'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-android-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: ${{ matrix.config }} arm64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Debug, Release]
+
+    env:
+      CLICOLOR_FORCE: 1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK r29
+        run: |
+          yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --sdk_root="${ANDROID_HOME}" "ndk;29.0.14206865"
+
+      - name: Install build tools
+        run: python -m pip install 'cmake>=3.29' ninja
+
+      - name: Show toolchain versions
+        run: |
+          python --version
+          java -version
+          cmake --version
+          ninja --version
+
+      - name: Prepare pinned dependencies and patches
+        run: python tools/setup_repo.py
+
+      - name: Build Vulkan driver proxy
+        run: bash os/android/scripts/build_driver_proxy.sh
+
+      - name: Build native components
+        env:
+          BUILD_TYPE: ${{ matrix.config == 'Debug' && 'RelWithDebInfo' || 'Release' }}
+          STRIP: ${{ matrix.config == 'Debug' && '0' || '1' }}
+        run: bash os/android/scripts/build_native.sh
+
+      - name: Build APK
+        run: |
+          VARIANT="${{ matrix.config == 'Debug' && 'debug' || 'release' }}"
+          bash os/android/scripts/build_apk.sh "$VARIANT"
+
+      - name: Package APK artifact
+        id: package
+        run: |
+          set -euo pipefail
+          VARIANT="${{ matrix.config == 'Debug' && 'debug' || 'release' }}"
+          APK_DIR="os/android/app/build/outputs/apk/$VARIANT"
+          APK_FILE=$(ls $APK_DIR/*.apk 2>/dev/null | head -n 1 || true)
+
+          if [[ -z "$APK_FILE" || ! -f "$APK_FILE" ]]; then
+            echo "::error::APK not found at $APK_DIR"
+            ls -la "$APK_DIR" || true
+            exit 1
+          fi
+
+          OUT_NAME="LibertyRecomp-android-${{ matrix.config }}-${{ github.sha }}.apk"
+          cp "$APK_FILE" "$RUNNER_TEMP/$OUT_NAME"
+          echo "artifact_path=$RUNNER_TEMP/$OUT_NAME" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$OUT_NAME" >> "$GITHUB_OUTPUT"
+          du -h "$RUNNER_TEMP/$OUT_NAME"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: ${{ steps.package.outputs.artifact_path }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload CMake logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmake-logs-android-${{ matrix.config }}
+          path: |
+            out/build/**/CMakeFiles/CMakeOutput.log
+            out/build/**/CMakeFiles/CMakeError.log
+            out/build/**/CMakeCache.txt
+            out/build/**/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: ignore
+          retention-days: 7

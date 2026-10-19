@@ -55,6 +55,7 @@ public class LibertyActivity extends SDLActivity {
     private static final String RESOURCES = "Resources";
     private static final String RESOURCES_STAMP = ".stamp";
     private static final String DEFAULT_ARGS = "default_args.txt";
+    private static final String DEFAULT_ARGS_LOWEND = "default_args_lowend.txt";
 
     private String[] mArguments = new String[0];
     /** "--android_surface=WxH" in args.txt: fixed swapchain size, scaled to the panel by the display hardware. */
@@ -157,6 +158,15 @@ public class LibertyActivity extends SDLActivity {
         String kgsl = readFirstLine(new File("/sys/class/kgsl/kgsl-3d0/gpu_model"));
         report.append("kgsl gpu: ").append(kgsl != null ? kgsl : "(not readable or not Adreno)")
                 .append('\n');
+        String socModel = null;
+        if (Build.VERSION.SDK_INT >= 31) {
+            socModel = Build.SOC_MODEL;
+        }
+        boolean weakGpu = isWeakAdreno(kgsl, socModel, Build.HARDWARE);
+        int highCapCores = getHighCapacityCpuCores();
+        report.append("low-end detection: ").append((weakGpu || highCapCores < 2) ? "yes" : "no")
+                .append(" (weak Adreno: ").append(weakGpu)
+                .append(", high-capacity CPU cores: ").append(highCapCores).append(")\n");
         report.append("driver.txt: ")
                 .append(mDriverText == null ? "(none)" : "\"" + mDriverText + "\"")
                 .append(" -> ").append(mDriverMode).append('\n');
@@ -266,8 +276,9 @@ public class LibertyActivity extends SDLActivity {
         if (!argsFile.isFile()) {
             // First launch: start from the tuned handheld profile bundled in
             // the APK; the copy stays editable next to LibertyRecomp/.
+            String defaultArgs = isLowEndDevice() ? DEFAULT_ARGS_LOWEND : DEFAULT_ARGS;
             try {
-                copyAssetTree(getAssets(), DEFAULT_ARGS, argsFile);
+                copyAssetTree(getAssets(), defaultArgs, argsFile);
             } catch (IOException e) {
                 Log.e(TAG, "writing default args failed", e);
             }
@@ -326,6 +337,125 @@ public class LibertyActivity extends SDLActivity {
         }
         Log.i(TAG, "data=" + dataRoot + " resources=" + resources
                 + " args=" + mArguments.length + " driver=" + mDriverMode);
+    }
+
+    /**
+     * Detects if the device is low-end: weak Adreno GPU (model < 650) or fewer
+     * than 2 high-capacity CPU cores.
+     */
+    private static boolean isLowEndDevice() {
+        String kgsl = readFirstLine(new File("/sys/class/kgsl/kgsl-3d0/gpu_model"));
+        String socModel = null;
+        if (Build.VERSION.SDK_INT >= 31) {
+            socModel = Build.SOC_MODEL;
+        }
+        boolean weakGpu = isWeakAdreno(kgsl, socModel, Build.HARDWARE);
+        int highCapCores = getHighCapacityCpuCores();
+        boolean weakCpu = highCapCores < 2;
+        boolean lowEnd = weakGpu || weakCpu;
+        Log.i(TAG, "low-end check: " + lowEnd + " (weakGpu=" + weakGpu + " [" + kgsl + "], highCapCores=" + highCapCores + ")");
+        return lowEnd;
+    }
+
+    private static boolean isWeakAdreno(String gpuModel, String socModel, String hardware) {
+        if (gpuModel != null && !gpuModel.isEmpty()) {
+            String lower = gpuModel.toLowerCase(Locale.ROOT);
+            if (lower.contains("adreno")) {
+                java.util.regex.Matcher matcher = java.util.regex.Pattern.compile(
+                        "adreno\\s*(?:\\(tm\\))?\\s*(\\d+)", java.util.regex.Pattern.CASE_INSENSITIVE)
+                        .matcher(lower);
+                if (matcher.find()) {
+                    try {
+                        int num = Integer.parseInt(matcher.group(1));
+                        if (num < 650) {
+                            return true;
+                        } else {
+                            return false;
+                        }
+                    } catch (NumberFormatException ignored) {
+                    }
+                }
+            }
+        }
+        String combined = ((socModel != null ? socModel : "") + " " + (hardware != null ? hardware : ""))
+                .toLowerCase(Locale.ROOT);
+        return combined.contains("sm6") || combined.contains("sdm6") || combined.contains("sdm7")
+                || combined.contains("sm71") || combined.contains("sm72") || combined.contains("sm73")
+                || combined.contains("sdm845") || combined.contains("msm8998");
+    }
+
+    private static int getHighCapacityCpuCores() {
+        int totalCores = 0;
+        long maxFreq = 0;
+        long minFreq = Long.MAX_VALUE;
+        List<Long> maxFreqs = new ArrayList<>();
+        List<Integer> capacities = new ArrayList<>();
+
+        File cpuDir = new File("/sys/devices/system/cpu");
+        if (cpuDir.exists() && cpuDir.isDirectory()) {
+            File[] files = cpuDir.listFiles();
+            if (files != null) {
+                for (File file : files) {
+                    String name = file.getName();
+                    if (name.matches("cpu\\d+")) {
+                        totalCores++;
+                        File capFile = new File(file, "cpu_capacity");
+                        String capStr = readFirstLine(capFile);
+                        if (capStr != null) {
+                            try {
+                                capacities.add(Integer.parseInt(capStr.trim()));
+                            } catch (NumberFormatException ignored) {
+                            }
+                        }
+
+                        File freqFile = new File(file, "cpufreq/cpuinfo_max_freq");
+                        String freqStr = readFirstLine(freqFile);
+                        if (freqStr != null) {
+                            try {
+                                long freq = Long.parseLong(freqStr.trim());
+                                maxFreqs.add(freq);
+                                if (freq > maxFreq) maxFreq = freq;
+                                if (freq < minFreq) minFreq = freq;
+                            } catch (NumberFormatException ignored) {
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (totalCores == 0) {
+            totalCores = Runtime.getRuntime().availableProcessors();
+        }
+
+        if (totalCores < 2) {
+            return totalCores;
+        }
+
+        if (capacities.size() >= totalCores && !capacities.isEmpty()) {
+            int capCount = 0;
+            for (int cap : capacities) {
+                if (cap >= 600) {
+                    capCount++;
+                }
+            }
+            return capCount;
+        }
+
+        if (!maxFreqs.isEmpty() && maxFreq > 0) {
+            if (maxFreq == minFreq && maxFreq <= 2050000L) {
+                return 0;
+            }
+            int highCapacityCount = 0;
+            for (long freq : maxFreqs) {
+                if (freq >= 2000000L && freq >= (long) (maxFreq * 0.85)) {
+                    highCapacityCount++;
+                }
+            }
+            return highCapacityCount;
+        }
+
+        return totalCores >= 8 ? 2 : 1;
     }
 
     /**

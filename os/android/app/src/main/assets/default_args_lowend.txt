@@ -1,19 +1,38 @@
+# Low-end profile: chosen automatically on first launch for weak devices
+# (Adreno below 650, or fewer than 3 fast CPU cores, e.g. Snapdragon 712).
+# Delete args.txt to go back to the automatic choice at the next start.
+#
+# Lines here override the in-game Display menu on every launch.
+# Not listed on purpose: values that are already the defaults (motion blur
+# off, shadow map 256, original reflection resolution, 30 FPS with VSync).
+# The app strips those exact lines from args.txt anyway.
 --log_level=warn
---gta4_output_height_cap=720
+
+# Render at ~540p and let FSR 1 upscale to 1080p output.
+--gta4_output_height_cap=1080
 --gta4_native_upscaler=fsr1
 --gta4_fsr1_quality=performance
+
+# Cheaper image
 --gta4_native_anti_aliasing=off
+--gta4_reflection_aa=off
+--gta4_reflection_capture_distance=near
+
+# Fewer draws: skip tiny draws in shadow and water reflection passes.
+# Small objects lose their shadow / reflection.
+--gta4_native_shadow_min_indices=300
+--gta4_native_water_reflection_min_indices=300
+
+# Lighter world (CPU)
 --gta4_dynamic_draw_distance=true
 --gta4_dynamic_draw_distance_min=0.55
 --gta4_shadow_distance_scale=1.0
---gta4_reflection_capture_distance=near
---gta4_reflection_aa=off
---gta4_traffic_density_scale=0.4
---gta4_parked_car_density_scale=0.4
---gta4_ped_density_scale=0.4
---gta4_scenario_ped_density_scale=0.4
+--gta4_traffic_density_scale=0.25
+--gta4_parked_car_density_scale=0.25
+--gta4_ped_density_scale=0.25
+--gta4_scenario_ped_density_scale=0.25
+
 --gta4_profile_native_detailed_cpu=false
 --gta4_profile_native_detailed_gpu=false
 --gta4_native_max_queued_frames=3
-# The 30 FPS guard (environment reflection rate only now) is off by default.
---gta4_fps_guard=0
+--gta4_fps_guard=2

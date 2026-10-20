@@ -56,6 +56,8 @@ public class LibertyActivity extends SDLActivity {
     private static final String RESOURCES_STAMP = ".stamp";
     private static final String DEFAULT_ARGS = "default_args.txt";
     private static final String DEFAULT_ARGS_LOWEND = "default_args_lowend.txt";
+    /** Fewer fast CPU cores than this counts as low-end (the Snapdragon 712 has 2). */
+    private static final int MIN_BIG_CORES = 3;
 
     private String[] mArguments = new String[0];
     /** "--android_surface=WxH" in args.txt: fixed swapchain size, scaled to the panel by the display hardware. */
@@ -162,9 +164,9 @@ public class LibertyActivity extends SDLActivity {
         if (Build.VERSION.SDK_INT >= 31) {
             socModel = Build.SOC_MODEL;
         }
-        boolean weakGpu = isWeakAdreno(kgsl, socModel, Build.HARDWARE);
+        boolean weakGpu = isWeakAdreno(kgsl, socModel, boardInfo());
         int highCapCores = getHighCapacityCpuCores();
-        report.append("low-end detection: ").append((weakGpu || highCapCores < 2) ? "yes" : "no")
+        report.append("low-end detection: ").append((weakGpu || highCapCores < MIN_BIG_CORES) ? "yes" : "no")
                 .append(" (weak Adreno: ").append(weakGpu)
                 .append(", high-capacity CPU cores: ").append(highCapCores).append(")\n");
         report.append("driver.txt: ")
@@ -349,12 +351,40 @@ public class LibertyActivity extends SDLActivity {
         if (Build.VERSION.SDK_INT >= 31) {
             socModel = Build.SOC_MODEL;
         }
-        boolean weakGpu = isWeakAdreno(kgsl, socModel, Build.HARDWARE);
+        boolean weakGpu = isWeakAdreno(kgsl, socModel, boardInfo());
         int highCapCores = getHighCapacityCpuCores();
-        boolean weakCpu = highCapCores < 2;
+        boolean weakCpu = highCapCores < MIN_BIG_CORES;
         boolean lowEnd = weakGpu || weakCpu;
         Log.i(TAG, "low-end check: " + lowEnd + " (weakGpu=" + weakGpu + " [" + kgsl + "], highCapCores=" + highCapCores + ")");
         return lowEnd;
+    }
+
+    /**
+     * Everything the platform says about the chip: Build.HARDWARE is just
+     * "qcom" on many phones, so the board name and /proc/cpuinfo help too.
+     * Build.SOC_MODEL only exists from Android 12.
+     */
+    private static String boardInfo() {
+        StringBuilder info = new StringBuilder();
+        info.append(Build.HARDWARE).append(' ').append(Build.BOARD);
+        String cpuinfo = readCpuInfoHardware();
+        if (cpuinfo != null) info.append(' ').append(cpuinfo);
+        return info.toString();
+    }
+
+    private static String readCpuInfoHardware() {
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                new FileInputStream("/proc/cpuinfo"), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.toLowerCase(Locale.ROOT).startsWith("hardware")) {
+                    int colon = line.indexOf(':');
+                    if (colon >= 0) return line.substring(colon + 1).trim();
+                }
+            }
+        } catch (IOException | SecurityException ignored) {
+        }
+        return null;
     }
 
     private static boolean isWeakAdreno(String gpuModel, String socModel, String hardware) {
@@ -381,7 +411,7 @@ public class LibertyActivity extends SDLActivity {
                 .toLowerCase(Locale.ROOT);
         return combined.contains("sm6") || combined.contains("sdm6") || combined.contains("sdm7")
                 || combined.contains("sm71") || combined.contains("sm72") || combined.contains("sm73")
-                || combined.contains("sdm845") || combined.contains("msm8998");
+                || combined.contains("sm4") || combined.contains("sdm845") || combined.contains("msm8");
     }
 
     private static int getHighCapacityCpuCores() {

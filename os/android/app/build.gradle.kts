@@ -22,7 +22,10 @@ android {
     ndkVersion  = "29.0.14206865"
 
     defaultConfig {
-        applicationId = "com.libertyrecomp"
+        // Optional: build with -PappId=other.package.name to change the
+        // installed package (data then lives under Android/data/<that name>).
+        // namespace above must stay com.libertyrecomp (the Java/JNI package).
+        applicationId = (project.findProperty("appId") as String?) ?: "com.libertyrecomp.lowend"
         // 28: ASharedMemory (26) for guest memory and AAudio (27) for audio.
         minSdk        = 29
         targetSdk     = 35
